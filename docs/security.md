@@ -54,6 +54,7 @@
 | `BOT_TOKEN`, `ADMIN_BOT_TOKEN` | env бота | контроль над ботом |
 | `BOT_WEBHOOK_SECRET` | env бота | подделка апдейтов |
 | Креды мерчантов | БД, AES-256-GCM | доступ к платёжным аккаунтам |
+| SSH-креды сервера (пароль/ключ) | БД (`server.ssh_secret`), AES-256-GCM; при `ssh_auth_type=vault_ref` — только ссылка `ssh_ref` | доступ по SSH к хосту ноды (как правило root); из дампа БД без `SECRETS_MASTER_KEY` не извлекается |
 | Reality private key | **только на ноде**, файл `reality_private_key_path` | компрометация ноды; в БД его нет никогда |
 
 ## Аутентификация оператора
