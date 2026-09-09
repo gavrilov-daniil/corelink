@@ -113,6 +113,20 @@
       "when": 1785040100000,
       "tag": "0015_admin_roles_telegram_auth",
       "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1785040110000,
+      "tag": "0016_telegram_web_login",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1785040120000,
+      "tag": "0017_server_ssh_access",
+      "breakpoints": true
     }
   ]
 }

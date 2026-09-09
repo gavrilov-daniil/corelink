@@ -45,6 +45,11 @@ export class InfraAdminController {
     return this.infra.deleteServer(id);
   }
 
+  @Post("servers/:id/ssh-check")
+  sshCheck(@Param("id") id: string) {
+    return this.infra.sshCheck(id);
+  }
+
   // --- config-профили ---
 
   @Get("config-profiles")

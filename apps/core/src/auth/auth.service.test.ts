@@ -12,17 +12,15 @@ import type { ExecutionContext } from "@nestjs/common";
 import type { Request } from "express";
 import { eq } from "drizzle-orm";
 import { schema, type Database } from "@corelink/db";
-import { cleanupOrg, closeDb, openDb, telegramWidgetPayload, TEST_ORG_ID } from "../testing/fixtures.test.js";
+import { cleanupOrg, closeDb, openDb, TEST_ORG_ID } from "../testing/fixtures.test.js";
 import { AdminGuard } from "../common/admin.guard.js";
 import { AuthService } from "./auth.service.js";
-import { TelegramAuthService, type TelegramLoginPayload } from "./telegram-auth.service.js";
+import type { TelegramIdentity } from "./telegram-oidc.service.js";
 import { MIN_ROLE_METADATA, type AdminRole, type OperatorContext } from "./roles.js";
 
-const BOT_TOKEN = "123456:AAH-fake-bot-token-for-tests";
 const PASSWORD = "correct-horse-battery";
 
 let db: Database;
-let telegram: TelegramAuthService;
 let auth: AuthService;
 let guard: AdminGuard;
 
@@ -40,11 +38,12 @@ const actorOf = (role: AdminRole, operatorId: string | null, email: string | nul
 
 const SHARED_TOKEN_ACTOR = actorOf("superadmin", null);
 
-const signPayload = (fields: Omit<TelegramLoginPayload, "hash">): TelegramLoginPayload =>
-  telegramWidgetPayload(fields as Record<string, string | number>, BOT_TOKEN) as unknown as TelegramLoginPayload;
-
-const freshPayload = (telegramId: number, username: string) =>
-  signPayload({ id: telegramId, auth_date: Math.floor(Date.now() / 1000), first_name: "Оператор", username });
+/** Личность из id_token: подпись проверена на слое OIDC, сюда приходит уже разобранной. */
+const identityOf = (telegramId: number, username: string): TelegramIdentity => ({
+  telegramId,
+  username,
+  displayName: "Оператор",
+});
 
 /** Контекст запроса с требуемой ролью на хендлере — ровно то, что читает гвард. */
 function contextFor(token: string, minRole?: AdminRole, path = "/api/admin/merchants"): ExecutionContext {
@@ -60,10 +59,8 @@ function contextFor(token: string, minRole?: AdminRole, path = "/api/admin/merch
 
 before(async () => {
   db = openDb();
-  telegram = new TelegramAuthService(db);
-  auth = new AuthService(db, telegram);
+  auth = new AuthService(db);
   guard = new AdminGuard(auth, new Reflector());
-  await telegram.updateSettings({ isEnabled: true, botUsername: "corelink_admin_bot", botToken: BOT_TOKEN });
 });
 
 after(async () => {
@@ -73,7 +70,7 @@ after(async () => {
 
 describe("заявка на доступ из Telegram", () => {
   it("незнакомый аккаунт получает заявку, а не доступ", async () => {
-    const result = await auth.loginWithTelegram({ payload: freshPayload(9_000_001, "newcomer") });
+    const result = await auth.loginWithTelegram({ identity: identityOf(9_000_001, "newcomer") });
 
     assert.equal(result.status, "pending");
     assert.equal("token" in result, false, "сессия неподтверждённому не выдаётся");
@@ -85,7 +82,7 @@ describe("заявка на доступ из Telegram", () => {
   });
 
   it("повторный вход не плодит заявок", async () => {
-    await auth.loginWithTelegram({ payload: freshPayload(9_000_001, "newcomer") });
+    await auth.loginWithTelegram({ identity: identityOf(9_000_001, "newcomer") });
 
     const rows = (await auth.listOperators()).filter((r) => r.telegramId === 9_000_001);
     assert.equal(rows.length, 1);
@@ -95,7 +92,7 @@ describe("заявка на доступ из Telegram", () => {
     const pending = (await auth.listOperators()).find((r) => r.telegramId === 9_000_001)!;
     await auth.approveOperator(pending.id, "support", SHARED_TOKEN_ACTOR);
 
-    const result = await auth.loginWithTelegram({ payload: freshPayload(9_000_001, "newcomer") });
+    const result = await auth.loginWithTelegram({ identity: identityOf(9_000_001, "newcomer") });
     assert.ok(result.status === "ok");
 
     const session = await auth.resolveSession(result.token);
@@ -107,18 +104,13 @@ describe("заявка на доступ из Telegram", () => {
     await auth.updateOperator(target.id, { status: "disabled" }, SHARED_TOKEN_ACTOR);
 
     await assert.rejects(
-      () => auth.loginWithTelegram({ payload: freshPayload(9_000_001, "newcomer") }),
+      () => auth.loginWithTelegram({ identity: identityOf(9_000_001, "newcomer") }),
       /доступ отключён/,
     );
 
     await auth.updateOperator(target.id, { status: "active" }, SHARED_TOKEN_ACTOR);
   });
 
-  it("устаревшая подпись не принимается", async () => {
-    const stale = signPayload({ id: 9_000_002, auth_date: Math.floor(Date.now() / 1000) - 3600, first_name: "Старый" });
-
-    await assert.rejects(() => auth.loginWithTelegram({ payload: stale }), /устарели/);
-  });
 });
 
 describe("заведение учёток", () => {
@@ -203,16 +195,16 @@ describe("защита от потери доступа", () => {
     const admin = (await auth.listOperators()).find((r) => r.email === "admin1@example.org")!;
 
     await assert.rejects(
-      () => auth.linkTelegram(freshPayload(9_000_001, "newcomer"), actorOf("admin", admin.id, admin.email)),
+      () => auth.linkTelegram(identityOf(9_000_001, "newcomer"), admin.id),
       /уже привязан/,
     );
   });
 
   it("свободный Telegram привязывается и открывает второй способ входа", async () => {
     const admin = (await auth.listOperators()).find((r) => r.email === "admin1@example.org")!;
-    await auth.linkTelegram(freshPayload(9_000_055, "admin_tg"), actorOf("admin", admin.id, admin.email));
+    await auth.linkTelegram(identityOf(9_000_055, "admin_tg"), admin.id);
 
-    const result = await auth.loginWithTelegram({ payload: freshPayload(9_000_055, "admin_tg") });
+    const result = await auth.loginWithTelegram({ identity: identityOf(9_000_055, "admin_tg") });
     assert.ok(result.status === "ok");
     assert.equal(result.operator.id, admin.id, "вход по Telegram обязан вести в ту же учётку");
   });
@@ -259,40 +251,5 @@ describe("гвард: роль спрашивается на маршруте", 
 
   it("маршруты вне /api/admin гвард не трогает", async () => {
     assert.equal(await guard.canActivate(contextFor("", "superadmin", "/healthz")), true);
-  });
-});
-
-describe("настройки входа по Telegram", () => {
-  it("токен бота наружу не отдаётся", async () => {
-    const settings = await telegram.settingsForAdmin();
-
-    assert.equal(settings.hasBotToken, true);
-    assert.equal((settings as Record<string, unknown>).botToken, undefined);
-  });
-
-  it("в БД токен лежит зашифрованным", async () => {
-    // Фильтр по org обязателен: в dev-базе лежит и настоящая строка настроек.
-    const [row] = await db
-      .select()
-      .from(schema.telegramAuthSetting)
-      .where(eq(schema.telegramAuthSetting.orgId, TEST_ORG_ID));
-
-    assert.notEqual(row.botToken, BOT_TOKEN);
-    assert.ok(row.botToken.startsWith("v1."), "формат шифртекста тот же, что у кредов мерчантов");
-  });
-
-  it("включить без токена нельзя", async () => {
-    await assert.rejects(() => telegram.updateSettings({ isEnabled: true, botToken: "" }), /нужны username/);
-  });
-
-  it("выключённый вход по Telegram не пускает даже с верной подписью", async () => {
-    await telegram.updateSettings({ isEnabled: false });
-
-    await assert.rejects(
-      () => auth.loginWithTelegram({ payload: freshPayload(9_000_001, "newcomer") }),
-      /выключен/,
-    );
-
-    await telegram.updateSettings({ isEnabled: true });
   });
 });

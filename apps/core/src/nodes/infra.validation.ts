@@ -15,6 +15,13 @@ export const NODE_ROLES = ["exit", "relay", "front"] as const;
 export const NODE_STATUSES = ["provisioning", "active", "disabled", "retiring"] as const;
 
 /**
+ * Способ SSH-доступа. vault_ref — доступ описан ссылкой (ssh_ref), сам секрет в БД
+ * не лежит и платформа по нему не ходит; password/key — секрет в ssh_secret.
+ */
+export const SSH_AUTH_TYPES = ["password", "key", "vault_ref"] as const;
+export type SshAuthType = (typeof SSH_AUTH_TYPES)[number];
+
+/**
  * Генератор ноды (buildNodeConfig) собирает ровно vless+reality. Строка с другим
  * протоколом или security приехала бы на ноду всё тем же reality-инбаундом, то есть
  * значение в БД врало бы про то, что реально работает.
@@ -205,6 +212,13 @@ export function tagStr(raw: Raw, key: string, opts: { required?: boolean } = {})
 
 export function hostnameStr(raw: Raw, key: string, opts: { required?: boolean } = {}): string | undefined {
   return str(raw, key, { ...opts, max: 253, pattern: HOSTNAME_RE, hint: "нужно доменное имя" });
+}
+
+/** Имя системного пользователя (useradd допускает такой набор). */
+const SSH_USER_RE = /^[a-z_][a-z0-9_-]{0,31}$/;
+
+export function sshUserStr(raw: Raw, key: string): string | null | undefined {
+  return nullableStr(raw, key, { max: 32, lower: true, pattern: SSH_USER_RE, hint: "имя linux-пользователя" });
 }
 
 export function shortIdArray(raw: Raw, key: string): string[] | undefined {

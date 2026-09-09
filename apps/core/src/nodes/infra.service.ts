@@ -1,9 +1,11 @@
 import { ConflictException, Inject, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { schema, type Database } from "@corelink/db";
+import { decryptCredentials, encryptCredentials } from "@corelink/core-kit";
 import { DB } from "../db/db.module.js";
 import { loadConfig } from "../config.js";
 import { NodeStateService } from "./node-state.service.js";
+import { probeSsh, type SshProbeCreds } from "./ssh-probe.js";
 import {
   FINGERPRINTS,
   INBOUND_FLOWS,
@@ -11,7 +13,9 @@ import {
   INBOUND_PROTOCOLS,
   INBOUND_SECURITY,
   NODE_STATUSES,
+  SSH_AUTH_TYPES,
   type Raw,
+  type SshAuthType,
   addressStr,
   alpnStr,
   assertInboundShape,
@@ -31,6 +35,7 @@ import {
   roleArray,
   shortIdArray,
   shortIdStr,
+  sshUserStr,
   str,
   tagStr,
   uuidStr,
@@ -119,14 +124,45 @@ export class InfraService {
     return rows.map((s) => ({ ...hideServerSecrets(s), nodeCount: byServer.get(s.id) ?? 0 }));
   }
 
+  /**
+   * Присланные секретные поля SSH в виде patch'а {password|privateKey|passphrase}.
+   * Не триммим: у ключа значим каждый байт, у пароля — крайние пробелы. Пустая
+   * строка сохраняется как маркер «удалить ключ» (её обрабатывает вызывающий).
+   */
+  private sshSecretInput(body: Raw): Record<string, string> {
+    const fields: Array<[input: string, out: string, max: number]> = [
+      ["sshPassword", "password", 1024],
+      ["sshPrivateKey", "privateKey", 32768],
+      ["sshPassphrase", "passphrase", 1024],
+    ];
+    const patch: Record<string, string> = {};
+    for (const [input, out, max] of fields) {
+      if (!has(body, input)) continue;
+      const value = body[input];
+      if (typeof value !== "string") bad(`${input}: ожидается строка`);
+      if ((value as string).length > max) bad(`${input}: длиннее ${max} символов`);
+      patch[out] = value as string;
+    }
+    return patch;
+  }
+
   private serverValues(body: Raw) {
+    const authType = (enumOf(body, "sshAuthType", SSH_AUTH_TYPES) ?? "vault_ref") as SshAuthType;
+    const secret = pruneSshSecret(
+      Object.fromEntries(Object.entries(this.sshSecretInput(body)).filter(([, v]) => v !== "")),
+      authType,
+    );
     return {
       orgId: this.org,
       hostname: hostnameStr(body, "hostname", { required: true })!,
       primaryIp: ipStr(body, "primaryIp", { required: true })!,
       extraIps: ipArray(body, "extraIps") ?? [],
       country: nullableStr(body, "country", { max: 8, upper: true }) ?? null,
+      sshAuthType: authType,
+      sshUser: sshUserStr(body, "sshUser") ?? null,
+      sshPort: portNum(body, "sshPort") ?? null,
       sshRef: nullableStr(body, "sshRef", { max: 256 }) ?? null,
+      sshSecret: encryptCredentials(secret, this.cfg.secretsMasterKey),
       capabilities: obj(body, "capabilities") ?? {},
     };
   }
@@ -144,14 +180,36 @@ export class InfraService {
 
   async updateServer(id: string, body: Raw) {
     requireUuid(id);
+    const authType = enumOf(body, "sshAuthType", SSH_AUTH_TYPES) as SshAuthType | undefined;
+
+    // Секрет пересобираем, только если его прислали или сменили тип доступа: правка
+    // одного hostname не должна тянуть чтение и перезапись кредов.
+    const secretPatch = this.sshSecretInput(body);
+    let sshSecret: Record<string, string> | undefined;
+    if (Object.keys(secretPatch).length > 0 || authType !== undefined) {
+      const current = await this.getServerRow(id);
+      const merged: Record<string, string> = { ...current.sshSecret };
+      for (const [k, v] of Object.entries(secretPatch)) {
+        if (v === "") delete merged[k];
+        else merged[k] = v; // сырой; encryptCredentials зашифрует только незашифрованное
+      }
+      const finalType = authType ?? (current.sshAuthType as SshAuthType);
+      sshSecret = encryptCredentials(pruneSshSecret(merged, finalType), this.cfg.secretsMasterKey);
+    }
+
     const values = compact({
       hostname: hostnameStr(body, "hostname"),
       primaryIp: ipStr(body, "primaryIp"),
       extraIps: ipArray(body, "extraIps"),
       country: nullableStr(body, "country", { max: 8, upper: true }),
+      sshAuthType: authType,
+      sshUser: sshUserStr(body, "sshUser"),
+      sshPort: portNum(body, "sshPort"),
       sshRef: nullableStr(body, "sshRef", { max: 256 }),
+      sshSecret,
       capabilities: obj(body, "capabilities"),
     });
+
     assertNotEmpty(values);
 
     const [row] = await this.db
@@ -161,6 +219,62 @@ export class InfraService {
       .returning();
     if (!row) throw new NotFoundException(`сервер ${id} не найден`);
     return hideServerSecrets(row);
+  }
+
+  /** Проверка SSH-доступа из админки: как healthCheck мерчанта — синхронно, с записью результата. */
+  async sshCheck(id: string) {
+    requireUuid(id);
+    const row = await this.getServerRow(id);
+    const result = await this.runSshProbe(row);
+    await this.db
+      .update(schema.server)
+      .set({
+        sshLastCheckAt: new Date(),
+        sshLastCheckOk: result.ok,
+        sshLastCheckError: result.ok ? null : result.detail,
+      })
+      .where(and(eq(schema.server.orgId, this.org), eq(schema.server.id, id)));
+    return result;
+  }
+
+  private async runSshProbe(row: typeof schema.server.$inferSelect): Promise<{ ok: boolean; detail: string }> {
+    const authType = row.sshAuthType as SshAuthType;
+    if (authType === "vault_ref") {
+      return { ok: false, detail: "доступ описан ссылкой в vault — платформа по нему не ходит; выберите пароль или ключ" };
+    }
+
+    let secret: Record<string, string>;
+    try {
+      secret = decryptCredentials(row.sshSecret, this.cfg.secretsMasterKey);
+    } catch (err) {
+      // Штатный сценарий: сменили SECRETS_MASTER_KEY или подняли дамп со старым ключом.
+      this.log.error(
+        `server ${row.hostname}: ssh-секрет не читается — ${err instanceof Error ? err.message : String(err)}. ` +
+          `Проверьте SECRETS_MASTER_KEY`,
+      );
+      return { ok: false, detail: "секрет не читается — проверьте SECRETS_MASTER_KEY" };
+    }
+
+    let creds: SshProbeCreds;
+    if (authType === "password") {
+      if (!secret.password) return { ok: false, detail: "пароль не задан" };
+      creds = { kind: "password", password: secret.password };
+    } else {
+      if (!secret.privateKey) return { ok: false, detail: "приватный ключ не задан" };
+      creds = { kind: "key", privateKey: secret.privateKey, passphrase: secret.passphrase || undefined };
+    }
+
+    return probeSsh({ host: row.primaryIp, port: row.sshPort ?? 22, user: row.sshUser || "root", creds });
+  }
+
+  private async getServerRow(id: string): Promise<typeof schema.server.$inferSelect> {
+    const [row] = await this.db
+      .select()
+      .from(schema.server)
+      .where(and(eq(schema.server.orgId, this.org), eq(schema.server.id, id)))
+      .limit(1);
+    if (!row) throw new NotFoundException(`сервер ${id} не найден`);
+    return row;
   }
 
   async deleteServer(id: string) {
@@ -1218,8 +1332,23 @@ export class InfraService {
 }
 
 function hideServerSecrets(row: typeof schema.server.$inferSelect) {
-  const { sshRef, ...rest } = row;
-  return { ...rest, hasSshRef: Boolean(sshRef) };
+  const { sshRef, sshSecret, ...rest } = row;
+  return { ...rest, hasSshRef: Boolean(sshRef), hasSshSecret: Object.keys(sshSecret ?? {}).length > 0 };
+}
+
+/**
+ * Оставляет в секрете только поля, релевантные способу доступа. Смена типа
+ * (был пароль → стал ключ) не должна оставлять в БД мёртвый пароль, а vault_ref
+ * не хранит секрета вовсе.
+ */
+function pruneSshSecret(secret: Record<string, string>, authType: SshAuthType): Record<string, string> {
+  const keep: Record<SshAuthType, string[]> = {
+    password: ["password"],
+    key: ["privateKey", "passphrase"],
+    vault_ref: [],
+  };
+  const allowed = keep[authType];
+  return Object.fromEntries(Object.entries(secret).filter(([k]) => allowed.includes(k)));
 }
 
 function hideInboundSecrets(row: typeof schema.inbound.$inferSelect) {

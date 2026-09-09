@@ -4,6 +4,7 @@ import {
   INBOUND_FLOWS,
   INBOUND_NETWORKS,
   NODE_ROLES,
+  checkServerSsh,
   createConfigProfile,
   createHost,
   createInbound,
@@ -35,6 +36,7 @@ import {
   type ProvisionResult,
   type RebuildInfo,
   type Server,
+  type SshAuthType,
   type Squad,
 } from "../api";
 import { useResource } from "../useResource";
@@ -96,6 +98,7 @@ export default function InfraPage() {
   const [mode, setMode] = useState<Mode>(loadMode);
   const [wizardOpen, setWizardOpen] = useState(false);
   const [enrollTarget, setEnrollTarget] = useState<{ id: string; name: string } | null>(null);
+  const [sshChecks, setSshChecks] = useState<Record<string, CheckState>>({});
 
   const switchMode = (next: Mode) => {
     setMode(next);
@@ -106,6 +109,17 @@ export default function InfraPage() {
     close();
     setNotice(describeRebuild(rebuilt));
     page.reload();
+  };
+
+  const runSshCheck = async (server: Server) => {
+    setSshChecks((prev) => ({ ...prev, [server.id]: { pending: true } }));
+    try {
+      const result = await checkServerSsh(server.id);
+      setSshChecks((prev) => ({ ...prev, [server.id]: { pending: false, ...result } }));
+      page.reload();
+    } catch (e) {
+      setSshChecks((prev) => ({ ...prev, [server.id]: { pending: false, ok: false, detail: errorMessage(e) } }));
+    }
   };
 
   if (page.loading) return <Loading />;
@@ -131,8 +145,8 @@ export default function InfraPage() {
     { key: "versions", title: "Версии", render: (s) => [s.agentVersion, s.xrayVersion].filter(Boolean).join(" / ") || "—" },
     {
       key: "ssh",
-      title: "SSH",
-      render: (s) => (s.hasSshRef ? <span className="ok small">ссылка в vault</span> : <span className="muted">—</span>),
+      title: "SSH-доступ",
+      render: (s) => <ServerSshCell server={s} check={sshChecks[s.id]} onCheck={() => runSshCheck(s)} />,
     },
     { key: "nodes", title: "Нод", align: "right", render: (s) => s.nodeCount },
     {
@@ -320,7 +334,7 @@ export default function InfraPage() {
         <>
       <Card
         title="Серверы"
-        subtitle="Физические VPS. SSH-ключ в базе не лежит — только ссылка на него в vault."
+        subtitle="Физические VPS. Доступ — пароль/ключ (шифруются в БД) или ссылка на vault."
         actions={
           <button type="button" className="btn btn-primary" onClick={() => setServerForm({ kind: "create" })}>
             Добавить сервер
@@ -566,7 +580,15 @@ function ServerModal({ row, onClose, onSaved }: { row?: Server; onClose: () => v
   const [primaryIp, setPrimaryIp] = useState(row?.primaryIp ?? "");
   const [extraIps, setExtraIps] = useState((row?.extraIps ?? []).join(", "));
   const [country, setCountry] = useState(row?.country ?? "");
+  const [authType, setAuthType] = useState<SshAuthType>(row?.sshAuthType ?? "vault_ref");
+  const [sshUser, setSshUser] = useState(row?.sshUser ?? "");
+  const [sshPort, setSshPort] = useState(row?.sshPort != null ? String(row.sshPort) : "");
   const [sshRef, setSshRef] = useState("");
+  const [sshPassword, setSshPassword] = useState("");
+  const [sshPrivateKey, setSshPrivateKey] = useState("");
+  const [sshPassphrase, setSshPassphrase] = useState("");
+
+  const secretHint = row?.hasSshSecret ? "задан; пустое поле не меняет" : undefined;
 
   return (
     <FormShell
@@ -577,14 +599,25 @@ function ServerModal({ row, onClose, onSaved }: { row?: Server; onClose: () => v
       deleteHint="Удалить сервер? Сработает, только если на нём нет нод."
       onDelete={row ? async () => void (await deleteServer(row.id)) : undefined}
       onSubmit={async () => {
+        // Секреты: пустое поле при правке ничего не меняет (значение мы не показываем).
+        const secret =
+          authType === "vault_ref"
+            ? {}
+            : {
+                sshUser: orNull(sshUser),
+                sshPort: sshPort.trim() ? Number(sshPort) : null,
+                ...(sshPassword ? { sshPassword } : {}),
+                ...(sshPrivateKey ? { sshPrivateKey } : {}),
+                ...(sshPassphrase ? { sshPassphrase } : {}),
+              };
         const body = {
           hostname: hostname.trim(),
           primaryIp: primaryIp.trim(),
           extraIps: toList(extraIps),
           country: orNull(country),
-          // пустое поле при правке ничего не меняет: показать текущее значение
-          // мы не можем (это указатель на секрет), значит и затирать его молча нельзя
-          ...(sshRef.trim() ? { sshRef: sshRef.trim() } : {}),
+          sshAuthType: authType,
+          ...(authType === "vault_ref" && sshRef.trim() ? { sshRef: sshRef.trim() } : {}),
+          ...secret,
         };
         if (row) await updateServer(row.id, body);
         else await createServer(body);
@@ -607,14 +640,115 @@ function ServerModal({ row, onClose, onSaved }: { row?: Server; onClose: () => v
           <input value={extraIps} onChange={(e) => setExtraIps(e.target.value)} placeholder="203.0.113.11" />
         </Field>
       </div>
-      <Field
-        label="Ссылка на SSH-доступ в vault"
-        hint={row?.hasSshRef ? "ссылка задана; пустое поле её не меняет" : "именно ссылка, не ключ: ключей в БД нет"}
-      >
-        <input value={sshRef} onChange={(e) => setSshRef(e.target.value)} placeholder="vault://projects/vpn/ssh/de1" />
+
+      <h3 className="form-section">SSH-доступ</h3>
+      <Field label="Способ" hint="пароль и ключ шифруются в БД; vault — только ссылка, платформа по ней не ходит">
+        <select value={authType} onChange={(e) => setAuthType(e.target.value as SshAuthType)}>
+          <option value="vault_ref">Ссылка на vault</option>
+          <option value="password">Пароль</option>
+          <option value="key">Приватный ключ</option>
+        </select>
       </Field>
+
+      {authType === "vault_ref" ? (
+        <Field
+          label="Ссылка на SSH-доступ в vault"
+          hint={row?.hasSshRef ? "ссылка задана; пустое поле её не меняет" : "именно ссылка, не ключ"}
+        >
+          <input value={sshRef} onChange={(e) => setSshRef(e.target.value)} placeholder="vault://projects/vpn/ssh/de1" />
+        </Field>
+      ) : (
+        <>
+          <div className="grid-2">
+            <Field label="SSH-пользователь" hint="по умолчанию root">
+              <input value={sshUser} onChange={(e) => setSshUser(e.target.value)} placeholder="root" />
+            </Field>
+            <Field label="SSH-порт" hint="по умолчанию 22">
+              <input value={sshPort} onChange={(e) => setSshPort(e.target.value)} inputMode="numeric" placeholder="22" />
+            </Field>
+          </div>
+          {authType === "password" ? (
+            <Field label="Пароль" hint={secretHint}>
+              <input
+                type="password"
+                value={sshPassword}
+                onChange={(e) => setSshPassword(e.target.value)}
+                autoComplete="new-password"
+                placeholder={row?.hasSshSecret ? "••••••••" : ""}
+              />
+            </Field>
+          ) : (
+            <>
+              <Field label="Приватный ключ" hint={secretHint ?? "PEM-формат (OpenSSH / RSA)"}>
+                <textarea
+                  value={sshPrivateKey}
+                  onChange={(e) => setSshPrivateKey(e.target.value)}
+                  rows={6}
+                  className="mono"
+                  placeholder={row?.hasSshSecret ? "ключ задан; вставьте новый, чтобы заменить" : "-----BEGIN OPENSSH PRIVATE KEY-----"}
+                />
+              </Field>
+              <Field label="Passphrase ключа" hint="если ключ без пароля — оставьте пустым">
+                <input
+                  type="password"
+                  value={sshPassphrase}
+                  onChange={(e) => setSshPassphrase(e.target.value)}
+                  autoComplete="new-password"
+                  placeholder={row?.hasSshSecret ? "••••••••" : ""}
+                />
+              </Field>
+            </>
+          )}
+        </>
+      )}
     </FormShell>
   );
+}
+
+interface CheckState {
+  pending: boolean;
+  ok?: boolean;
+  detail?: string;
+}
+
+const SSH_AUTH_LABEL: Record<SshAuthType, string> = {
+  password: "пароль",
+  key: "ключ",
+  vault_ref: "vault",
+};
+
+function ServerSshCell({ server, check, onCheck }: { server: Server; check?: CheckState; onCheck: () => void }) {
+  const configured = server.sshAuthType !== "vault_ref" ? server.hasSshSecret : server.hasSshRef;
+
+  return (
+    <div>
+      <div className="small">
+        <span className={configured ? "ok" : "muted"}>{SSH_AUTH_LABEL[server.sshAuthType]}</span>
+        {server.sshAuthType !== "vault_ref" && server.sshUser && (
+          <span className="muted mono"> {server.sshUser}@{server.primaryIp}:{server.sshPort ?? 22}</span>
+        )}
+      </div>
+      <div>
+        <SshCheckStatus server={server} check={check} />
+      </div>
+      {server.sshAuthType !== "vault_ref" && (
+        <button type="button" className="btn btn-sm" onClick={onCheck} disabled={check?.pending}>
+          {check?.pending ? "Проверка…" : "Проверить связь"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function SshCheckStatus({ server, check }: { server: Server; check?: CheckState }) {
+  if (check && !check.pending) {
+    return <span className={`small ${check.ok ? "ok" : "err"}`}>{check.ok ? "связь есть" : check.detail}</span>;
+  }
+  if (server.sshLastCheckOk === true) return <span className="small ok">связь была</span>;
+  if (server.sshLastCheckOk === false) {
+    return <span className="small err">{server.sshLastCheckError ?? "нет связи"}</span>;
+  }
+  return null;
 }
 
 function ProfileModal({ row, onClose, onSaved }: { row?: ConfigProfile; onClose: () => void; onSaved: SavedHandler }) {

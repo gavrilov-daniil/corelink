@@ -14,7 +14,7 @@ import { schema, type Database } from "@corelink/db";
 import { DB } from "../db/db.module.js";
 import { loadConfig } from "../config.js";
 import { isAdminRole, roleAtLeast, type AdminRole, type OperatorContext } from "./roles.js";
-import { TelegramAuthService, type TelegramLoginPayload } from "./telegram-auth.service.js";
+import type { TelegramIdentity } from "./telegram-oidc.service.js";
 
 const scrypt = promisify(scryptCb);
 
@@ -51,10 +51,7 @@ export class AuthService {
   private readonly log = new Logger(AuthService.name);
   private readonly cfg = loadConfig();
 
-  constructor(
-    @Inject(DB) private readonly db: Database,
-    private readonly telegram: TelegramAuthService,
-  ) {}
+  constructor(@Inject(DB) private readonly db: Database) {}
 
   async hashPassword(password: string): Promise<string> {
     const salt = randomBytes(16);
@@ -114,11 +111,11 @@ export class AuthService {
    * админки такому человеку не открывается.
    */
   async loginWithTelegram(input: {
-    payload: TelegramLoginPayload;
+    identity: TelegramIdentity;
     userAgent?: string;
     ip?: string;
   }): Promise<TelegramLoginResult> {
-    const identity = await this.telegram.verifyLogin(input.payload);
+    const { identity } = input;
 
     const existing = await this.findByTelegramId(identity.telegramId);
     if (!existing) {
@@ -350,12 +347,9 @@ export class AuthService {
   // --- привязка Telegram -----------------------------------------------------
 
   /** Привязка Telegram к своей учётке: владение подтверждается тем же виджетом, что и вход. */
-  async linkTelegram(payload: TelegramLoginPayload, actor: OperatorContext) {
-    if (!actor.operatorId) throw new ForbiddenException("вход по общему токену не привязывается к Telegram");
-    const identity = await this.telegram.verifyLogin(payload);
-
+  async linkTelegram(identity: TelegramIdentity, operatorId: string) {
     const owner = await this.findByTelegramId(identity.telegramId);
-    if (owner && owner.id !== actor.operatorId) {
+    if (owner && owner.id !== operatorId) {
       throw new BadRequestException("этот Telegram уже привязан к другой учётке");
     }
 
@@ -366,7 +360,7 @@ export class AuthService {
         telegramUsername: identity.username,
         displayName: identity.displayName,
       })
-      .where(eq(schema.user.id, actor.operatorId));
+      .where(eq(schema.user.id, operatorId));
 
     return { telegramId: identity.telegramId, telegramUsername: identity.username };
   }

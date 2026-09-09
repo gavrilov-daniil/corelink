@@ -3,7 +3,7 @@ import {
   changeOwnPassword,
   errorMessage,
   getTelegramLoginConfig,
-  linkOwnTelegram,
+  startTelegramLink,
   unlinkOwnTelegram,
   MIN_PASSWORD_LENGTH,
   ROLE_HINTS,
@@ -68,7 +68,7 @@ function TelegramLinkCard({
   hasPassword: boolean;
   onChanged: () => void;
 }) {
-  const config = useResource(getTelegramLoginConfig).data ?? { enabled: false, botUsername: "" };
+  const config = useResource(getTelegramLoginConfig).data ?? { enabled: false };
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -101,15 +101,9 @@ function TelegramLinkCard({
           </button>
         </div>
       ) : (
-        <TelegramLoginButton
-          botUsername={config.botUsername}
-          onAuth={(payload) => {
-            setError(null);
-            linkOwnTelegram(payload)
-              .then(onChanged)
-              .catch((e) => setError(errorMessage(e)));
-          }}
-        />
+        // Привязка идёт тем же уходом в Telegram, что и вход: вернувшись, страница
+        // перечитает профиль, поэтому onChanged здесь не нужен.
+        <TelegramLoginButton label="Привязать Telegram" start={startTelegramLink} onError={setError} />
       )}
     </Card>
   );

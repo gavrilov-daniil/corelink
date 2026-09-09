@@ -6,11 +6,12 @@ import {
   errorMessage,
   getAdminToken,
   getMe,
+  exchangeTelegramTicket,
   getTelegramLoginConfig,
   loginWithPassword,
-  loginWithTelegram,
   logout,
   setAdminToken,
+  startTelegramLogin,
   type Me,
 } from "../api";
 import { useResource } from "../useResource";
@@ -20,6 +21,12 @@ import ErrorBox from "./ErrorBox";
 import Loading from "./Loading";
 import TelegramLoginButton from "./TelegramLoginButton";
 
+/** Возврат от Telegram: экран входа не должен мелькнуть до обмена билета на сессию. */
+function hasTelegramReturn(): boolean {
+  const params = new URLSearchParams(window.location.search);
+  return params.has("tg") || params.has("tg_error");
+}
+
 /**
  * Вход в админку и контекст сессии.
  *
@@ -28,8 +35,9 @@ import TelegramLoginButton from "./TelegramLoginButton";
  */
 export default function AuthGate({ children }: { children: ReactNode }) {
   const [me, setMe] = useState<Me | null>(null);
-  const [loading, setLoading] = useState(Boolean(getAdminToken()));
+  const [loading, setLoading] = useState(Boolean(getAdminToken()) || hasTelegramReturn());
   const [error, setError] = useState<string | null>(null);
+  const [pendingRequest, setPendingRequest] = useState(false);
 
   const load = useCallback(async () => {
     if (!getAdminToken()) {
@@ -54,8 +62,43 @@ export default function AuthGate({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  /**
+   * Возврат от Telegram: в адресной строке лежит одноразовый билет, а не токен
+   * сессии. Меняем его на сессию и сразу чистим URL — иначе билет останется в
+   * истории браузера и в закладке.
+   */
   useEffect(() => {
-    void load();
+    const params = new URLSearchParams(window.location.search);
+    const ticket = params.get("tg");
+    const failure = params.get("tg_error");
+    if (!ticket && !failure) {
+      void load();
+      return;
+    }
+
+    window.history.replaceState({}, "", window.location.pathname);
+
+    if (failure) {
+      setError(failure === "denied" ? "Вход через Telegram отменён" : "Telegram не подтвердил вход");
+      void load();
+      return;
+    }
+
+    void (async () => {
+      try {
+        const result = await exchangeTelegramTicket(ticket!);
+        if (result.status === "ok") {
+          setAdminToken(result.token);
+        } else if (result.status === "pending") {
+          setPendingRequest(true);
+        }
+        // linked — привязка к уже открытой сессии: профиль перечитается ниже.
+      } catch (e) {
+        setError(errorMessage(e));
+      } finally {
+        await load();
+      }
+    })();
   }, [load]);
 
   const signOut = useCallback(() => {
@@ -74,7 +117,8 @@ export default function AuthGate({ children }: { children: ReactNode }) {
             <img src={logoLight} alt="CoreLink" />
           </div>
           <LoginScreen
-          initialError={error}
+            initialError={error}
+            initialPending={pendingRequest}
             onToken={(token) => {
               setAdminToken(token);
               void load();
@@ -92,15 +136,23 @@ export default function AuthGate({ children }: { children: ReactNode }) {
   );
 }
 
-function LoginScreen({ onToken, initialError }: { onToken: (token: string) => void; initialError: string | null }) {
+function LoginScreen({
+  onToken,
+  initialError,
+  initialPending,
+}: {
+  onToken: (token: string) => void;
+  initialError: string | null;
+  initialPending: boolean;
+}) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(initialError);
-  const [pending, setPending] = useState(false);
+  const [pending] = useState(initialPending);
   const [serviceToken, setServiceToken] = useState("");
   // Настройки входа не должны мешать входу: не отдались — просто нет кнопки Telegram.
-  const telegram = useResource(getTelegramLoginConfig).data ?? { enabled: false, botUsername: "" };
+  const telegram = useResource(getTelegramLoginConfig).data ?? { enabled: false };
 
   const submitPassword = async (e: FormEvent) => {
     e.preventDefault();
@@ -154,16 +206,7 @@ function LoginScreen({ onToken, initialError }: { onToken: (token: string) => vo
         {telegram.enabled && (
           <div className="login-alt">
             <span className="muted small">или</span>
-            <TelegramLoginButton
-              botUsername={telegram.botUsername}
-              onAuth={(payload) => {
-                setError(null);
-                setPending(false);
-                loginWithTelegram(payload)
-                  .then((result) => (result.status === "ok" ? onToken(result.token) : setPending(true)))
-                  .catch((err) => setError(errorMessage(err)));
-              }}
-            />
+            <TelegramLoginButton label="Войти через Telegram" start={startTelegramLogin} onError={setError} />
           </div>
         )}
 

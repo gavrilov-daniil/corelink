@@ -52,11 +52,20 @@ export const user = pgTable("user", {
 ]);
 
 /**
- * Настройки входа по Telegram (Login Widget). Одна строка на org, правится из админки.
+ * Настройки входа по Telegram (Web Login, OpenID Connect). Одна строка на org,
+ * правится из админки.
  *
- * Токен бота — секрет: лежит зашифрованным тем же AES-256-GCM, что и креды мерчантов,
- * наружу отдаётся только признак «задан». Он же ключ проверки подписи виджета,
- * поэтому его утечка = возможность подделать вход любого оператора.
+ * `client_secret` — секрет: лежит зашифрованным тем же AES-256-GCM, что и креды
+ * мерчантов, наружу отдаётся только признак «задан». В отличие от прежнего
+ * Login Widget, ключ входа больше не совпадает с токеном бота: утёкший секрет
+ * даёт подделать вход, но не доступ к Bot API, и отзывается в BotFather отдельно.
+ *
+ * `redirect_uri` хранится, а не собирается из хоста: Telegram принимает только
+ * заранее зарегистрированные URL, и значение обязано совпасть с BotFather
+ * посимвольно — включая схему, порт и путь.
+ *
+ * `bot_token` остался от Login Widget и больше не используется. Колонка снимается
+ * отдельным релизом: разрушающий DDL не едет вместе с кодом, который её знал.
  */
 export const telegramAuthSetting = pgTable("telegram_auth_setting", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -64,6 +73,9 @@ export const telegramAuthSetting = pgTable("telegram_auth_setting", {
   isEnabled: boolean("is_enabled").notNull().default(false),
   botUsername: text("bot_username").notNull().default(""),
   botToken: text("bot_token").notNull().default(""),
+  clientId: text("client_id").notNull().default(""),
+  clientSecret: text("client_secret").notNull().default(""),
+  redirectUri: text("redirect_uri").notNull().default(""),
   createdAt: createdAt(),
   updatedAt: updatedAt(),
 }, (t) => [uniqueIndex("telegram_auth_setting_org_uq").on(t.orgId)]);

@@ -991,11 +991,6 @@ select {
   gap: var(--cl-space-2);
 }
 
-/* Виджет Telegram рисует себя сам в iframe — задаём только высоту, чтобы карточка не прыгала. */
-.tg-login {
-  min-height: 40px;
-}
-
 .login-service {
   margin-top: var(--cl-space-5);
   border-top: 1px solid var(--cl-border);

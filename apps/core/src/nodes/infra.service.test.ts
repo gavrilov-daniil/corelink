@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, it } from "node:test";
 import { eq } from "drizzle-orm";
 import { schema, type Database } from "@corelink/db";
+import { isEncrypted } from "@corelink/core-kit";
 import { TEST_ORG_ID, cleanupOrg, closeDb, createSubscriber, createSubscription, openDb } from "../testing/fixtures.test.js";
 import { NodeStateService } from "./node-state.service.js";
 import { InfraService } from "./infra.service.js";
@@ -459,6 +460,24 @@ describe("секреты наружу не отдаются", () => {
     assert.equal(row.hasSshRef, true);
   });
 
+  it("ssh_secret не отдаётся наружу — только признак hasSshSecret", async () => {
+    const created = await server({ sshAuthType: "password", sshUser: "root", sshPassword: "s3cret" });
+    assert.equal("sshSecret" in created, false);
+    assert.equal(created.hasSshSecret, true);
+    assert.equal(created.sshAuthType, "password");
+    assert.equal(created.sshUser, "root");
+    const [listed] = await infra.listServers();
+    assert.equal("sshSecret" in listed, false);
+    assert.equal(listed.hasSshSecret, true);
+  });
+
+  it("пароль лежит в БД зашифрованным, не текстом", async () => {
+    const created = await server({ sshAuthType: "password", sshPassword: "s3cret" });
+    const [row] = await db.select().from(schema.server).where(eq(schema.server.id, created.id)).limit(1);
+    assert.equal(isEncrypted(row.sshSecret.password), true);
+    assert.notEqual(row.sshSecret.password, "s3cret");
+  });
+
   it("reality_privkey_ref и raw_json не попадают в список inbound'ов", async () => {
     const n = await node();
     await infra.createInbound({
@@ -472,5 +491,63 @@ describe("секреты наружу не отдаются", () => {
     assert.equal("realityPrivkeyRef" in row, false);
     assert.equal("rawJson" in row, false);
     assert.equal(row.hasRealityPrivkeyRef, true);
+  });
+});
+
+describe("SSH-доступ", () => {
+  async function stored(id: string) {
+    const [row] = await db.select().from(schema.server).where(eq(schema.server.id, id)).limit(1);
+    return row;
+  }
+
+  it("неизвестный тип доступа отвергается", async () => {
+    await assert.rejects(() => server({ sshAuthType: "telnet" }), (e) => status(e) === 400);
+  });
+
+  it("невалидный ssh-пользователь отвергается", async () => {
+    await assert.rejects(
+      () => server({ sshAuthType: "password", sshUser: "root; rm -rf /", sshPassword: "x" }),
+      (e) => status(e) === 400,
+    );
+  });
+
+  it("смена типа доступа чистит неактуальный секрет", async () => {
+    const created = await server({ sshAuthType: "password", sshPassword: "s3cret" });
+    await infra.updateServer(created.id, { sshAuthType: "key", sshPrivateKey: "KEYDATA" });
+    const row = await stored(created.id);
+    assert.equal("password" in row.sshSecret, false);
+    assert.equal(isEncrypted(row.sshSecret.privateKey), true);
+    assert.equal(row.sshAuthType, "key");
+  });
+
+  it("пустая строка секрета при правке удаляет ключ", async () => {
+    const created = await server({ sshAuthType: "password", sshPassword: "s3cret" });
+    await infra.updateServer(created.id, { sshPassword: "" });
+    const row = await stored(created.id);
+    assert.equal("password" in row.sshSecret, false);
+  });
+
+  it("правка hostname не трогает секрет", async () => {
+    const created = await server({ sshAuthType: "password", sshPassword: "s3cret" });
+    await infra.updateServer(created.id, { hostname: "renamed.example.com" });
+    const row = await stored(created.id);
+    assert.equal(isEncrypted(row.sshSecret.password), true);
+  });
+
+  it("проверка vault_ref не ходит по сети и пишет результат", async () => {
+    const created = await server({ sshAuthType: "vault_ref", sshRef: "vault://x" });
+    const result = await infra.sshCheck(created.id);
+    assert.equal(result.ok, false);
+    assert.match(result.detail, /vault/);
+    const row = await stored(created.id);
+    assert.equal(row.sshLastCheckOk, false);
+    assert.notEqual(row.sshLastCheckAt, null);
+  });
+
+  it("проверка password без пароля — «не задан», без коннекта", async () => {
+    const created = await server({ sshAuthType: "password", sshUser: "root" });
+    const result = await infra.sshCheck(created.id);
+    assert.equal(result.ok, false);
+    assert.match(result.detail, /не задан/);
   });
 });

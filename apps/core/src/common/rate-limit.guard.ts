@@ -9,8 +9,16 @@ import { INTERNAL_PATH_PREFIX } from "./service-token.guard.js";
 
 export const WEBHOOK_PATH_PREFIX = "/webhooks";
 export const ADMIN_LOGIN_PATH = "/api/admin/auth/login";
-/** Вход по Telegram — та же неаутентифицированная точка и тот же лимит, что у пароля. */
-export const ADMIN_TELEGRAM_LOGIN_PATH = "/api/admin/auth/telegram/login";
+/**
+ * Вход по Telegram — те же неаутентифицированные точки и тот же лимит, что у пароля.
+ * `callback` и `exchange` здесь не для защиты пароля, а против перебора state и билета:
+ * оба одноразовые, но угадывать их с одного IP тысячами попыток тоже не нужно.
+ */
+export const ADMIN_TELEGRAM_LOGIN_PATHS = [
+  "/api/admin/auth/telegram/start",
+  "/api/admin/auth/telegram/callback",
+  "/api/admin/auth/telegram/exchange",
+];
 
 interface Check {
   key: string;
@@ -67,7 +75,7 @@ export class RateLimitGuard implements CanActivate {
   }
 
   private checksFor(req: Request, path: string, ip: string): Check[] {
-    if (path === ADMIN_LOGIN_PATH || path === ADMIN_TELEGRAM_LOGIN_PATH) {
+    if (path === ADMIN_LOGIN_PATH || ADMIN_TELEGRAM_LOGIN_PATHS.includes(path)) {
       // Два ключа сразу: по IP — против перебора пароля одной учётки, по email —
       // против того же перебора, размазанного по ботнету и сменившего IP.
       // У входа по Telegram email в теле нет, поэтому второй ключ не добавится сам.

@@ -3,6 +3,13 @@ import { createdAt, orgId, updatedAt } from "./_shared.js";
 import { subscription } from "./subscribers.js";
 
 // Физический хост/VPS.
+//
+// SSH-доступ описан одним из трёх способов (ssh_auth_type): паролем, приватным
+// ключом или ссылкой в vault (прежнее поведение, ssh_ref). Сами пароль/ключ лежат
+// в ssh_secret ЗАШИФРОВАННЫМИ (AES-256-GCM на SECRETS_MASTER_KEY, тот же механизм,
+// что и креды мерчантов): наружу отдаётся только признак «задан», а модель угроз
+// честная — ключ шифрования и шифртекст на одном боксе, поэтому это защита от дампа
+// БД/бэкапа, а не от компрометации хоста. При vault_ref секрета в БД нет вовсе.
 export const server = pgTable("server", {
   id: uuid("id").primaryKey().defaultRandom(),
   orgId: orgId(),
@@ -11,7 +18,14 @@ export const server = pgTable("server", {
   extraIps: jsonb("extra_ips").$type<string[]>().notNull().default([]),
   country: text("country"),
   providerId: uuid("provider_id"),
-  sshRef: text("ssh_ref"), // ссылка в vault, не сам ключ
+  sshAuthType: text("ssh_auth_type").notNull().default("vault_ref"), // password | key | vault_ref
+  sshUser: text("ssh_user"),
+  sshPort: integer("ssh_port"), // NULL = 22
+  sshRef: text("ssh_ref"), // ссылка в vault (для ssh_auth_type=vault_ref), не сам ключ
+  sshSecret: jsonb("ssh_secret").$type<Record<string, string>>().notNull().default({}), // {password} | {privateKey, passphrase?}, зашифровано
+  sshLastCheckAt: timestamp("ssh_last_check_at", { withTimezone: true }),
+  sshLastCheckOk: boolean("ssh_last_check_ok"),
+  sshLastCheckError: text("ssh_last_check_error"),
   capabilities: jsonb("capabilities").$type<Record<string, unknown>>().notNull().default({}),
   agentStatus: text("agent_status").notNull().default("unknown"),
   agentVersion: text("agent_version"),

@@ -5,17 +5,28 @@ import {
   Delete,
   Get,
   Headers,
+  Logger,
   Param,
   Patch,
   Post,
+  Query,
   Req,
+  Res,
   UnauthorizedException,
 } from "@nestjs/common";
-import type { Request } from "express";
+import type { Request, Response } from "express";
 import { AuthService } from "./auth.service.js";
 import { Operator } from "./operator.decorator.js";
 import { MinRole, PublicRoute, requireOwnOperatorId, type OperatorContext } from "./roles.js";
-import { TelegramAuthService, type TelegramLoginPayload } from "./telegram-auth.service.js";
+import { TelegramOidcService } from "./telegram-oidc.service.js";
+
+/**
+ * Кука связывает начатый вход с браузером. Путь сужен до самих ручек входа:
+ * на остальные запросы админки она не отправляется вовсе.
+ */
+const BINDER_COOKIE = "cl_tg_oidc";
+const BINDER_PATH = "/api/admin/auth/telegram";
+const BINDER_TTL_SEC = 600;
 
 /**
  * Вход и управление учётками. Без @MinRole действует `admin` — то есть всё, что
@@ -24,9 +35,11 @@ import { TelegramAuthService, type TelegramLoginPayload } from "./telegram-auth.
  */
 @Controller("api/admin/auth")
 export class AuthController {
+  private readonly log = new Logger(AuthController.name);
+
   constructor(
     private readonly auth: AuthService,
-    private readonly telegram: TelegramAuthService,
+    private readonly telegram: TelegramOidcService,
   ) {}
 
   @Post("login")
@@ -49,18 +62,82 @@ export class AuthController {
   }
 
   /**
-   * Вход по Telegram Login Widget. Незнакомый аккаунт получает `status: pending` —
-   * это заявка, которую подтверждает админ. Сессии в таком ответе нет.
+   * Начало входа через Telegram Web Login. Ответ — адрес экрана Telegram; туда
+   * админка уходит сама. Кука с этим же ответом привязывает начатый вход к браузеру.
    */
-  @Post("telegram/login")
+  @Post("telegram/start")
   @PublicRoute()
-  telegramLogin(@Body() body: TelegramLoginPayload, @Req() req: Request) {
-    if (!body?.id || !body?.hash) throw new BadRequestException("нет данных Telegram");
-    return this.auth.loginWithTelegram({
-      payload: body,
-      userAgent: req.headers["user-agent"] as string | undefined,
-      ip: req.ip,
+  async telegramStart(@Res({ passthrough: true }) res: Response) {
+    const started = await this.telegram.start({ intent: "login" });
+    setBinderCookie(res, started);
+    return { url: started.url };
+  }
+
+  /** Привязка Telegram к своей учётке идёт тем же флоу — отличается только намерением. */
+  @Post("telegram/link/start")
+  @MinRole("support")
+  async telegramLinkStart(@Operator() operator: OperatorContext, @Res({ passthrough: true }) res: Response) {
+    const started = await this.telegram.start({
+      intent: "link",
+      operatorId: requireOwnOperatorId(operator),
     });
+    setBinderCookie(res, started);
+    return { url: started.url };
+  }
+
+  /**
+   * Возврат от Telegram. Сюда приходит браузер, а не наш код, поэтому результат
+   * кладётся в одноразовый билет и отдаётся ссылкой: токен сессии в адресной
+   * строке остался бы в истории браузера и в логах прокси.
+   */
+  @Get("telegram/callback")
+  @PublicRoute()
+  async telegramCallback(
+    @Query() query: { code?: string; state?: string; error?: string },
+    @Req() req: Request,
+    @Res() res: Response,
+  ) {
+    const home = await this.telegram.appOrigin();
+    res.clearCookie(BINDER_COOKIE, { path: BINDER_PATH });
+
+    if (query.error || !query.code || !query.state) {
+      return res.redirect(`${home}/?tg_error=denied`);
+    }
+
+    try {
+      const finished = await this.telegram.finish({
+        code: query.code,
+        state: query.state,
+        binder: readCookie(req, BINDER_COOKIE),
+      });
+
+      const result =
+        finished.intent === "link" && finished.operatorId
+          ? { status: "linked" as const, ...(await this.auth.linkTelegram(finished.identity, finished.operatorId)) }
+          : await this.auth.loginWithTelegram({
+              identity: finished.identity,
+              userAgent: req.headers["user-agent"] as string | undefined,
+              ip: req.ip,
+            });
+
+      const ticket = await this.telegram.issueTicket(result);
+      return res.redirect(`${home}/?tg=${encodeURIComponent(ticket)}`);
+    } catch (err) {
+      this.logCallbackFailure(err);
+      return res.redirect(`${home}/?tg_error=failed`);
+    }
+  }
+
+  /**
+   * Обмен билета на сессию. Билет одноразовый и живёт минуту, поэтому отдельной
+   * защиты от повтора здесь не нужно — второй запрос вернёт «ссылка устарела».
+   */
+  @Post("telegram/exchange")
+  @PublicRoute()
+  async telegramExchange(@Body() body: { ticket?: string }) {
+    const result = await this.telegram.takeTicket<unknown>(body?.ticket ?? "");
+    if (!result) throw new BadRequestException("ссылка входа устарела, попробуйте ещё раз");
+    return result;
   }
 
   @Post("logout")
@@ -78,14 +155,6 @@ export class AuthController {
   @MinRole("support")
   me(@Operator() operator: OperatorContext) {
     return operator;
-  }
-
-  /** Привязка Telegram к своей учётке: после неё вход работает обоими способами. */
-  @Post("telegram/link")
-  @MinRole("support")
-  linkTelegram(@Body() body: TelegramLoginPayload, @Operator() operator: OperatorContext) {
-    if (!body?.id || !body?.hash) throw new BadRequestException("нет данных Telegram");
-    return this.auth.linkTelegram(body, operator);
   }
 
   @Delete("telegram/link")
@@ -151,7 +220,49 @@ export class AuthController {
   }
 
   @Patch("telegram/settings")
-  updateTelegramSettings(@Body() body: { isEnabled?: boolean; botUsername?: string; botToken?: string }) {
+  updateTelegramSettings(
+    @Body()
+    body: {
+      isEnabled?: boolean;
+      botUsername?: string;
+      clientId?: string;
+      clientSecret?: string;
+      redirectUri?: string;
+    },
+  ) {
     return this.telegram.updateSettings(body ?? {});
   }
+
+  /**
+   * Причину провала callback знает только лог: наружу уходит редирект без деталей,
+   * иначе подбирающий state читал бы по тексту, какая проверка не прошла.
+   */
+  private logCallbackFailure(err: unknown) {
+    this.log.warn(`вход по Telegram не состоялся: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+function setBinderCookie(res: Response, started: { binder: string; origin: string }) {
+  res.cookie(BINDER_COOKIE, started.binder, {
+    httpOnly: true,
+    // Lax, а не Strict: возврат от Telegram — это переход по ссылке с чужого сайта,
+    // при Strict куку браузер бы не отправил и вход ломался бы всегда.
+    sameSite: "lax",
+    // Secure по origin самой админки: на http://localhost такая кука не сохранится,
+    // и локальная отладка входа стала бы невозможной.
+    secure: started.origin.startsWith("https://"),
+    path: BINDER_PATH,
+    maxAge: BINDER_TTL_SEC * 1000,
+  });
+}
+
+/** Куки читаем сами: ради одного значения тащить cookie-parser в общий пайплайн незачем. */
+function readCookie(req: Request, name: string): string {
+  const header = req.headers.cookie;
+  if (!header) return "";
+  for (const part of header.split(";")) {
+    const [key, ...rest] = part.trim().split("=");
+    if (key === name) return decodeURIComponent(rest.join("="));
+  }
+  return "";
 }

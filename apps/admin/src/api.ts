@@ -120,33 +120,39 @@ export interface LoginResult {
   operator: { id: string; email: string | null; role: AdminRole; displayName: string | null };
 }
 
-/** Ответ Telegram Login Widget: набор полей и подпись, проверяет её core. */
-export type TelegramAuthPayload = Record<string, string | number>;
-
-/** Заявка (`pending`) сессии не даёт: доступа нет, пока админ не подтвердит. */
-export type TelegramLoginResult = { status: "pending" } | ({ status: "ok" } & LoginResult);
-
-export interface TelegramLoginConfig {
-  enabled: boolean;
-  botUsername: string;
-}
+/**
+ * Результат входа через Telegram, забранный по одноразовому билету.
+ * Заявка (`pending`) сессии не даёт: доступа нет, пока админ не подтвердит.
+ * `linked` возвращается, когда тем же флоу привязывали Telegram к своей учётке.
+ */
+export type TelegramLoginResult =
+  | { status: "pending" }
+  | { status: "linked"; telegramId: number; telegramUsername: string | null }
+  | ({ status: "ok" } & LoginResult);
 
 export interface TelegramSettings {
   isEnabled: boolean;
   botUsername: string;
-  /** Сам токен наружу не отдаётся — только признак, что он задан. */
-  hasBotToken: boolean;
+  clientId: string;
+  redirectUri: string;
+  /** Сам секрет наружу не отдаётся — только признак, что он задан. */
+  hasClientSecret: boolean;
   updatedAt: string | null;
 }
 
 export const loginWithPassword = (email: string, password: string) =>
   request<LoginResult>("/api/admin/auth/login", post({ email, password }));
 
-export const loginWithTelegram = (payload: TelegramAuthPayload) =>
-  request<TelegramLoginResult>("/api/admin/auth/telegram/login", post(payload));
+/** Ссылка на экран Telegram. Заодно сервер ставит куку, связывающую вход с браузером. */
+export const startTelegramLogin = () => request<{ url: string }>("/api/admin/auth/telegram/start", post());
 
-export const getTelegramLoginConfig = () =>
-  request<TelegramLoginConfig>("/api/admin/auth/telegram/config");
+/** Тот же флоу, но для привязки Telegram к уже открытой учётке. */
+export const startTelegramLink = () => request<{ url: string }>("/api/admin/auth/telegram/link/start", post());
+
+export const exchangeTelegramTicket = (ticket: string) =>
+  request<TelegramLoginResult>("/api/admin/auth/telegram/exchange", post({ ticket }));
+
+export const getTelegramLoginConfig = () => request<{ enabled: boolean }>("/api/admin/auth/telegram/config");
 
 export const getMe = () => request<Me>("/api/admin/auth/me");
 
@@ -154,9 +160,6 @@ export const logout = () => request<{ ok: boolean }>("/api/admin/auth/logout", p
 
 export const changeOwnPassword = (password: string) =>
   request<{ ok: boolean }>("/api/admin/auth/password", post({ password }));
-
-export const linkOwnTelegram = (payload: TelegramAuthPayload) =>
-  request<{ telegramId: number; telegramUsername: string | null }>("/api/admin/auth/telegram/link", post(payload));
 
 export const unlinkOwnTelegram = () => request<{ ok: boolean }>("/api/admin/auth/telegram/link", del());
 
@@ -187,8 +190,10 @@ export const getTelegramSettings = () => request<TelegramSettings>("/api/admin/a
 export const updateTelegramSettings = (body: {
   isEnabled?: boolean;
   botUsername?: string;
+  clientId?: string;
+  redirectUri?: string;
   /** Не передан — не трогаем; пустая строка — стираем. */
-  botToken?: string;
+  clientSecret?: string;
 }) => request<TelegramSettings>("/api/admin/auth/telegram/settings", patch(body));
 
 // --- Мерчанты ---------------------------------------------------------------
@@ -379,6 +384,8 @@ export const FINGERPRINTS = [
 export const INBOUND_NETWORKS = ["tcp", "grpc", "xhttp", "ws"] as const;
 export const INBOUND_FLOWS = ["xtls-rprx-vision", ""] as const;
 
+export type SshAuthType = "password" | "key" | "vault_ref";
+
 export interface Server {
   id: string;
   hostname: string;
@@ -391,8 +398,16 @@ export interface Server {
   xrayVersion: string | null;
   lastHeartbeatAt: string | null;
   createdAt: string;
+  sshAuthType: SshAuthType;
+  sshUser: string | null;
+  sshPort: number | null;
   /** ssh_ref — указатель в vault; наружу отдаётся только признак, что он задан. */
   hasSshRef: boolean;
+  /** Пароль/ключ лежат в БД зашифрованными; наружу — только признак «задан». */
+  hasSshSecret: boolean;
+  sshLastCheckAt: string | null;
+  sshLastCheckOk: boolean | null;
+  sshLastCheckError: string | null;
   nodeCount: number;
 }
 
@@ -463,7 +478,14 @@ export const createServer = (body: {
   primaryIp: string;
   extraIps?: string[];
   country?: string | null;
+  sshAuthType?: SshAuthType;
+  sshUser?: string | null;
+  sshPort?: number | null;
   sshRef?: string | null;
+  /** Секреты; наружу не возвращаются. Пустая строка при правке = очистить ключ. */
+  sshPassword?: string;
+  sshPrivateKey?: string;
+  sshPassphrase?: string;
   capabilities?: Record<string, unknown>;
 }) => request<Server>("/api/admin/servers", post(body));
 
@@ -471,6 +493,9 @@ export const updateServer = (id: string, body: Partial<Parameters<typeof createS
   request<Server>(`/api/admin/servers/${id}`, patch(body));
 
 export const deleteServer = (id: string) => request<{ ok: boolean }>(`/api/admin/servers/${id}`, del());
+
+export const checkServerSsh = (id: string) =>
+  request<{ ok: boolean; detail: string }>(`/api/admin/servers/${id}/ssh-check`, post());
 
 export const getConfigProfiles = () => request<ConfigProfile[]>("/api/admin/config-profiles");
 

@@ -1,51 +1,37 @@
-import { useEffect, useRef } from "react";
-import type { TelegramAuthPayload } from "../api";
+import { useState } from "react";
+import { errorMessage } from "../api";
 
 interface Props {
-  botUsername: string;
-  onAuth: (payload: TelegramAuthPayload) => void;
-}
-
-/** Виджет зовёт глобальную функцию по имени из data-onauth — своего колбэка он не принимает. */
-declare global {
-  interface Window {
-    corelinkTelegramAuth?: (user: TelegramAuthPayload) => void;
-  }
+  label: string;
+  /** Ручка, выдающая ссылку на экран Telegram: вход или привязка. */
+  start: () => Promise<{ url: string }>;
+  onError: (message: string) => void;
 }
 
 /**
- * Кнопка Telegram Login Widget. Скрипт грузится с telegram.org и рисует свою кнопку
- * в iframe — подменить её содержимое или прочитать оттуда данные нельзя, поэтому
- * вся вёрстка здесь сводится к контейнеру.
- *
- * Домен админки должен быть привязан к боту через /setdomain в BotFather, иначе
- * виджет отрисуется, но по нажатию ответит ошибкой домена.
+ * Кнопка ухода в Telegram. Прежний Login Widget рисовал себя сам в iframe с
+ * telegram.org; в Web Login браузер просто переходит по ссылке, которую выдал
+ * наш сервер, — сторонний скрипт на странице входа больше не нужен.
  */
-export default function TelegramLoginButton({ botUsername, onAuth }: Props) {
-  const container = useRef<HTMLDivElement>(null);
-  const handler = useRef(onAuth);
-  handler.current = onAuth;
+export default function TelegramLoginButton({ label, start, onError }: Props) {
+  const [busy, setBusy] = useState(false);
 
-  useEffect(() => {
-    const node = container.current;
-    if (!node || !botUsername) return;
+  const go = async () => {
+    setBusy(true);
+    try {
+      const { url } = await start();
+      // Не открываем новую вкладку: кука входа поставлена этому окну, и возврат
+      // от Telegram должен прийти в него же.
+      window.location.assign(url);
+    } catch (err) {
+      onError(errorMessage(err));
+      setBusy(false);
+    }
+  };
 
-    window.corelinkTelegramAuth = (user) => handler.current(user);
-
-    const script = document.createElement("script");
-    script.src = "https://telegram.org/js/telegram-widget.js?22";
-    script.async = true;
-    script.setAttribute("data-telegram-login", botUsername);
-    script.setAttribute("data-size", "large");
-    script.setAttribute("data-userpic", "false");
-    script.setAttribute("data-onauth", "corelinkTelegramAuth(user)");
-    node.appendChild(script);
-
-    return () => {
-      node.replaceChildren();
-      delete window.corelinkTelegramAuth;
-    };
-  }, [botUsername]);
-
-  return <div className="tg-login" ref={container} />;
+  return (
+    <button type="button" className="btn" disabled={busy} onClick={() => void go()}>
+      {busy ? "Открываем Telegram…" : label}
+    </button>
+  );
 }

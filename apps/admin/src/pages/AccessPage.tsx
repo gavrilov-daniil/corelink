@@ -416,7 +416,10 @@ function PasswordModal({
   );
 }
 
-/** Настройка Login Widget. Токен бота — секрет: наружу отдаётся только признак «задан». */
+/**
+ * Настройка Telegram Web Login. Секрет наружу не отдаётся — только признак «задан».
+ * Значения берутся в BotFather: Bot Settings → Web Login.
+ */
 function TelegramSettingsCard({
   current,
   onSaved,
@@ -425,11 +428,21 @@ function TelegramSettingsCard({
   onSaved: (next: TelegramSettings) => void;
 }) {
   const [botUsername, setBotUsername] = useState(current.botUsername);
-  const [botToken, setBotToken] = useState("");
+  const [clientId, setClientId] = useState(current.clientId);
+  const [redirectUri, setRedirectUri] = useState(
+    current.redirectUri || `${window.location.origin}/api/admin/auth/telegram/callback`,
+  );
+  const [clientSecret, setClientSecret] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const save = async (patch: { isEnabled?: boolean; botUsername?: string; botToken?: string }) => {
+  const save = async (patch: {
+    isEnabled?: boolean;
+    botUsername?: string;
+    clientId?: string;
+    redirectUri?: string;
+    clientSecret?: string;
+  }) => {
     setBusy(true);
     setError(null);
     try {
@@ -457,26 +470,40 @@ function TelegramSettingsCard({
         />
       </div>
 
-      <Field
-        label="Username бота"
-        hint="Без @. Домен админки должен быть привязан к этому боту командой /setdomain в BotFather — иначе виджет ответит ошибкой домена."
-      >
-        <input value={botUsername} onChange={(e) => setBotUsername(e.target.value)} placeholder="corelink_admin_bot" />
+      <Field label="Username бота" hint="Без @. На вход не влияет — нужен, чтобы было видно, какой бот подключён.">
+        <input value={botUsername} onChange={(e) => setBotUsername(e.target.value)} placeholder="corelink_ops_bot" />
       </Field>
 
+      <div className="grid-2">
+        <Field label="Client ID" hint="BotFather → Bot Settings → Web Login. Это идентификатор бота.">
+          <input value={clientId} onChange={(e) => setClientId(e.target.value)} placeholder="7777777" />
+        </Field>
+
+        <Field
+          label="Client secret"
+          hint={
+            current.hasClientSecret
+              ? "Секрет задан и хранится зашифрованным. Введите новый, чтобы заменить."
+              : "Выдаётся там же, рядом с Client ID. Отзывается отдельно от токена бота."
+          }
+        >
+          <input
+            type="password"
+            value={clientSecret}
+            onChange={(e) => setClientSecret(e.target.value)}
+            placeholder={current.hasClientSecret ? "••••••••" : "секрет из BotFather"}
+          />
+        </Field>
+      </div>
+
       <Field
-        label="Токен бота"
-        hint={
-          current.hasBotToken
-            ? "Токен задан и хранится зашифрованным. Введите новый, чтобы заменить."
-            : "Токен от BotFather. Им проверяется подпись входа, поэтому он секрет."
-        }
+        label="Redirect URI"
+        hint="Этот же адрес добавьте в Allowed URLs у бота. Telegram сверяет его посимвольно: расхождение в схеме или пути ломает вход."
       >
         <input
-          type="password"
-          value={botToken}
-          onChange={(e) => setBotToken(e.target.value)}
-          placeholder={current.hasBotToken ? "••••••••" : "123456:AA…"}
+          value={redirectUri}
+          onChange={(e) => setRedirectUri(e.target.value)}
+          placeholder="https://admin.example.org/api/admin/auth/telegram/callback"
         />
       </Field>
 
@@ -488,8 +515,10 @@ function TelegramSettingsCard({
           onClick={() =>
             void save({
               botUsername: botUsername.trim(),
-              // Пустое поле означает «не трогать токен»: стереть его можно, выключив вход.
-              ...(botToken.trim() ? { botToken: botToken.trim() } : {}),
+              clientId: clientId.trim(),
+              redirectUri: redirectUri.trim(),
+              // Пустое поле означает «не трогать секрет»: стереть его можно, выключив вход.
+              ...(clientSecret.trim() ? { clientSecret: clientSecret.trim() } : {}),
             })
           }
         >
