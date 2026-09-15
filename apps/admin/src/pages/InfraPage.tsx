@@ -3,6 +3,7 @@ import {
   FINGERPRINTS,
   INBOUND_FLOWS,
   INBOUND_NETWORKS,
+  NODE_ROLES,
   createConfigProfile,
   createHost,
   createInbound,
@@ -20,6 +21,8 @@ import {
   getNodes,
   getServers,
   getSquads,
+  issueEnrollment,
+  provisionLocation,
   updateConfigProfile,
   updateHost,
   updateInbound,
@@ -29,20 +32,44 @@ import {
   type Host,
   type Inbound,
   type Node,
+  type ProvisionResult,
   type RebuildInfo,
   type Server,
   type Squad,
 } from "../api";
 import { useResource } from "../useResource";
+import { formatDateTime } from "../format";
 import Card from "../components/Card";
 import Table, { type Column } from "../components/Table";
 import Modal from "../components/Modal";
 import Field from "../components/Field";
 import Toggle from "../components/Toggle";
 import StatusBadge from "../components/StatusBadge";
+import CopyButton from "../components/CopyButton";
 import EmptyState from "../components/EmptyState";
 import ErrorBox from "../components/ErrorBox";
 import Loading from "../components/Loading";
+
+type Mode = "simple" | "advanced";
+
+const MODE_KEY = "infra-mode";
+
+/** Режим страницы держим между заходами: оператор выбирает его один раз. */
+function loadMode(): Mode {
+  try {
+    return localStorage.getItem(MODE_KEY) === "advanced" ? "advanced" : "simple";
+  } catch {
+    return "simple";
+  }
+}
+
+function saveMode(mode: Mode): void {
+  try {
+    localStorage.setItem(MODE_KEY, mode);
+  } catch {
+    // приватный режим/заблокированное хранилище — не критично, просто не запомним
+  }
+}
 
 type Editing<T> = { kind: "create" } | { kind: "edit"; row: T } | null;
 
@@ -65,6 +92,14 @@ export default function InfraPage() {
   const [hostForm, setHostForm] = useState<Editing<Host>>(null);
   const [squadForm, setSquadForm] = useState<Editing<Squad>>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [mode, setMode] = useState<Mode>(loadMode);
+  const [wizardOpen, setWizardOpen] = useState(false);
+  const [enrollTarget, setEnrollTarget] = useState<{ id: string; name: string } | null>(null);
+
+  const switchMode = (next: Mode) => {
+    setMode(next);
+    saveMode(next);
+  };
 
   const done = (close: () => void) => (rebuilt?: RebuildInfo[]) => {
     close();
@@ -246,13 +281,42 @@ export default function InfraPage() {
     <>
       <div className="page-head">
         <h1>Инфраструктура</h1>
-        <button type="button" className="btn" onClick={page.reload}>
-          Обновить
-        </button>
+        <div className="row-actions">
+          <div className="seg">
+            <button
+              type="button"
+              className={`btn btn-sm ${mode === "simple" ? "btn-primary" : ""}`}
+              onClick={() => switchMode("simple")}
+            >
+              Простой
+            </button>
+            <button
+              type="button"
+              className={`btn btn-sm ${mode === "advanced" ? "btn-primary" : ""}`}
+              onClick={() => switchMode("advanced")}
+            >
+              Продвинутый
+            </button>
+          </div>
+          <button type="button" className="btn" onClick={page.reload}>
+            Обновить
+          </button>
+        </div>
       </div>
 
       {notice && <div className="notice">{notice}</div>}
 
+      {mode === "simple" && (
+        <SimpleInfra
+          nodes={nodes}
+          inbounds={inbounds}
+          onAdd={() => setWizardOpen(true)}
+          onEnroll={(n) => setEnrollTarget(n)}
+        />
+      )}
+
+      {mode === "advanced" && (
+        <>
       <Card
         title="Серверы"
         subtitle="Физические VPS. SSH-ключ в базе не лежит — только ссылка на него в vault."
@@ -342,6 +406,24 @@ export default function InfraPage() {
           <Table columns={squadColumns} rows={squads} rowKey={(s) => s.id} />
         )}
       </Card>
+        </>
+      )}
+
+      {wizardOpen && (
+        <LocationWizard
+          squads={squads}
+          inbounds={inbounds}
+          onClose={() => setWizardOpen(false)}
+          onProvisioned={(msg) => {
+            setNotice(msg);
+            page.reload();
+          }}
+          onEnroll={(n) => setEnrollTarget(n)}
+        />
+      )}
+      {enrollTarget && (
+        <AgentEnrollModal node={enrollTarget} onClose={() => setEnrollTarget(null)} />
+      )}
 
       {serverForm && (
         <ServerModal
@@ -887,5 +969,407 @@ function SquadModal({
         Набор заменяется целиком: снятая галочка убирает подписчиков squad'а с этого inbound'а на ноде.
       </p>
     </FormShell>
+  );
+}
+
+// --- простой режим ----------------------------------------------------------
+
+/**
+ * Простой режим: одна локация = одна нода, без пяти таблиц. Показывает список
+ * локаций со статусом и мастер, который заводит всю цепочку за один экран.
+ */
+function SimpleInfra({
+  nodes,
+  inbounds,
+  onAdd,
+  onEnroll,
+}: {
+  nodes: Node[];
+  inbounds: Inbound[];
+  onAdd: () => void;
+  onEnroll: (n: { id: string; name: string }) => void;
+}) {
+  // первый inbound ноды: в простом режиме на ноду заводится ровно один
+  const inboundByNode = new Map<string, Inbound>();
+  for (const i of inbounds) if (i.nodeId && !inboundByNode.has(i.nodeId)) inboundByNode.set(i.nodeId, i);
+
+  const columns: Column<Node>[] = [
+    {
+      key: "name",
+      title: "Локация",
+      render: (n) => (
+        <div>
+          <div className="strong">{n.name}</div>
+          <div className="muted small mono">
+            {n.serverHostname ?? n.address ?? "—"}
+            {n.country ? ` · ${n.country}` : ""}
+          </div>
+        </div>
+      ),
+    },
+    {
+      key: "state",
+      title: "Состояние",
+      render: (n) => {
+        const s = locationState(n, inboundByNode.get(n.id));
+        return <StatusBadge status="loc" tone={s.tone} label={s.label} />;
+      },
+    },
+    {
+      key: "inbound",
+      title: "Вход",
+      render: (n) => inboundByNode.get(n.id)?.tag ?? <span className="muted">нет</span>,
+    },
+    {
+      key: "actions",
+      title: "",
+      align: "right",
+      render: (n) => (
+        <button type="button" className="btn btn-sm" onClick={() => onEnroll({ id: n.id, name: n.name })}>
+          Токен агента
+        </button>
+      ),
+    },
+  ];
+
+  return (
+    <>
+      <Card
+        title="Как это работает"
+        subtitle="Локация = сервер с одной нодой. Мастер сам заведёт сервер, ноду, вход (inbound) и endpoint — вместо пяти форм."
+      >
+        <ol className="steps">
+          <li>«Добавить локацию» → имя, IP сервера и домен-маскировку (SNI).</li>
+          <li>Отметьте, в какие squad'ы (наборы доступа) выдавать — или пропустите.</li>
+          <li>Выпустите токен агента и поставьте агента на сервер: он сам заберёт конфиг и пришлёт ключи.</li>
+        </ol>
+        <div className="row-actions">
+          <button type="button" className="btn btn-primary" onClick={onAdd}>
+            Добавить локацию
+          </button>
+        </div>
+      </Card>
+
+      <Card title="Локации" subtitle="Ноды сети. «Работает» — агент применил актуальный конфиг.">
+        {nodes.length === 0 ? (
+          <EmptyState text="Локаций нет" hint="Нажмите «Добавить локацию» выше." />
+        ) : (
+          <Table columns={columns} rows={nodes} rowKey={(n) => n.id} />
+        )}
+      </Card>
+    </>
+  );
+}
+
+/** Состояние локации в терминах оператора, без деталей про хеши конфига. */
+function locationState(n: Node, inbound?: Inbound): { tone: "ok" | "warn" | "muted"; label: string } {
+  if (!inbound) return { tone: "muted", label: "нет входа" };
+  // pbk пустой или нет ни одного heartbeat — агента ещё не поставили/не энроллили
+  if (!inbound.realityPublicKey || !n.lastHeartbeatAt) return { tone: "warn", label: "ждёт агента" };
+  if (n.converged) return { tone: "ok", label: `работает, v${n.desiredVersion ?? 0}` };
+  return { tone: "warn", label: "не сошёлся" };
+}
+
+/** Самый частый SNI в уже заведённых inbound'ах — разумный дефолт для новой локации. */
+function commonSni(inbounds: Inbound[]): string {
+  const counts = new Map<string, number>();
+  for (const i of inbounds) if (i.sni) counts.set(i.sni, (counts.get(i.sni) ?? 0) + 1);
+  let best = "";
+  let bestN = 0;
+  for (const [sni, n] of counts) {
+    if (n > bestN) {
+      best = sni;
+      bestN = n;
+    }
+  }
+  return best;
+}
+
+// --- мастер «Добавить локацию» ----------------------------------------------
+
+function LocationWizard({
+  squads,
+  inbounds,
+  onClose,
+  onProvisioned,
+  onEnroll,
+}: {
+  squads: Squad[];
+  inbounds: Inbound[];
+  onClose: () => void;
+  onProvisioned: (msg: string) => void;
+  onEnroll: (n: { id: string; name: string }) => void;
+}) {
+  const [name, setName] = useState("");
+  const [primaryIp, setPrimaryIp] = useState("");
+  const [country, setCountry] = useState("");
+  const [sni, setSni] = useState(() => commonSni(inbounds));
+  const [port, setPort] = useState("443");
+  const [selectedSquads, setSelectedSquads] = useState<string[]>([]);
+  // продвинутое — под <details>, с дефолтами общего случая
+  const [hostname, setHostname] = useState("");
+  const [tag, setTag] = useState("");
+  const [roles, setRoles] = useState<string[]>(["exit"]);
+  const [fingerprint, setFingerprint] = useState("firefox");
+
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<ProvisionResult | null>(null);
+
+  const toggleSquad = (id: string, on: boolean) =>
+    setSelectedSquads((prev) => (on ? [...new Set([...prev, id])] : prev.filter((x) => x !== id)));
+  const toggleRole = (role: string, on: boolean) =>
+    setRoles((prev) => (on ? [...new Set([...prev, role])] : prev.filter((r) => r !== role)));
+
+  const submit = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await provisionLocation({
+        name: name.trim(),
+        primaryIp: primaryIp.trim(),
+        sni: sni.trim(),
+        country: country.trim() || undefined,
+        port: Number(port) || undefined,
+        hostname: hostname.trim() || undefined,
+        tag: tag.trim() || undefined,
+        roles,
+        fingerprint,
+        squadIds: selectedSquads,
+      });
+      setResult(res);
+      onProvisioned(describeProvision(res));
+    } catch (e) {
+      setError(errorMessage(e));
+      setBusy(false);
+    }
+  };
+
+  if (result) {
+    return (
+      <Modal
+        title="Локация заведена"
+        onClose={onClose}
+        footer={
+          <>
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={() => {
+                onEnroll({ id: result.node.id, name: result.node.label });
+                onClose();
+              }}
+            >
+              Выпустить токен агента
+            </button>
+            <button type="button" className="btn" onClick={onClose}>
+              Закрыть
+            </button>
+          </>
+        }
+      >
+        <ul className="provision-summary">
+          <li>{refLine("Сервер", result.server)}</li>
+          <li>{refLine("Профиль", result.configProfile)}</li>
+          <li>{refLine("Нода", result.node)}</li>
+          <li>{refLine("Вход (inbound)", result.inbound)}</li>
+          <li>{refLine("Endpoint (host)", result.host)}</li>
+        </ul>
+        {result.squads.length > 0 && (
+          <p className="small">Выдаётся в squad'ах: {result.squads.map((s) => s.name).join(", ")}.</p>
+        )}
+        <p className="muted small">
+          Reality-ключи проставятся автоматически после энроллмента агента — до этого вход помечен «ждёт агента».
+        </p>
+      </Modal>
+    );
+  }
+
+  const disabled = busy || !name.trim() || !primaryIp.trim() || !sni.trim();
+
+  return (
+    <Modal
+      title="Добавить локацию"
+      onClose={onClose}
+      footer={
+        <>
+          {error && <span className="err">{error}</span>}
+          <button type="button" className="btn" onClick={onClose}>
+            Отмена
+          </button>
+          <button type="button" className="btn btn-primary" disabled={disabled} onClick={() => void submit()}>
+            {busy ? "Заводим…" : "Создать"}
+          </button>
+        </>
+      }
+    >
+      <div className="grid-2">
+        <Field label="Название" required hint="напр. de1-exit — станет именем ноды">
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="de1-exit" />
+        </Field>
+        <Field label="Страна" hint="код: DE, FI, NL">
+          <input value={country} onChange={(e) => setCountry(e.target.value)} maxLength={8} placeholder="DE" />
+        </Field>
+      </div>
+      <div className="grid-2">
+        <Field label="IP сервера" required>
+          <input value={primaryIp} onChange={(e) => setPrimaryIp(e.target.value)} placeholder="203.0.113.10" />
+        </Field>
+        <Field label="Порт" hint="обычно 443">
+          <input value={port} onChange={(e) => setPort(e.target.value)} inputMode="numeric" />
+        </Field>
+      </div>
+      <Field
+        label="Домен-маскировка (SNI)"
+        required
+        hint="под какой сайт маскируется Reality: крупный домен с TLS 1.3, который не заблокирован"
+      >
+        <input value={sni} onChange={(e) => setSni(e.target.value)} placeholder="ads.x5.ru" />
+      </Field>
+
+      <h3 className="form-section">Выдавать в squad'ах</h3>
+      {squads.length === 0 ? (
+        <p className="muted small">Squad'ов пока нет — можно завести локацию сейчас и выдать её позже.</p>
+      ) : (
+        <div className="checks">
+          {squads.map((s) => (
+            <label key={s.id} className="check">
+              <input
+                type="checkbox"
+                checked={selectedSquads.includes(s.id)}
+                onChange={(e) => toggleSquad(s.id, e.target.checked)}
+              />
+              <span>{s.name}</span>
+            </label>
+          ))}
+        </div>
+      )}
+
+      <details className="advanced">
+        <summary>Продвинутые параметры</summary>
+        <div className="grid-2">
+          <Field label="Домен/hostname сервера" hint="по умолчанию = IP">
+            <input value={hostname} onChange={(e) => setHostname(e.target.value)} placeholder="по умолчанию IP" />
+          </Field>
+          <Field label="Тег входа" hint="по умолчанию VLESS_REALITY_<ИМЯ>">
+            <input value={tag} onChange={(e) => setTag(e.target.value)} placeholder="авто" />
+          </Field>
+        </div>
+        <Field label="Fingerprint" hint="uTLS-отпечаток клиента">
+          <select value={fingerprint} onChange={(e) => setFingerprint(e.target.value)}>
+            {FINGERPRINTS.map((f) => (
+              <option key={f} value={f}>
+                {f}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="Роли" hint="по умолчанию exit">
+          <div className="checks">
+            {NODE_ROLES.map((role) => (
+              <label key={role} className="check">
+                <input
+                  type="checkbox"
+                  checked={roles.includes(role)}
+                  onChange={(e) => toggleRole(role, e.target.checked)}
+                />
+                <span>{role}</span>
+              </label>
+            ))}
+          </div>
+        </Field>
+      </details>
+    </Modal>
+  );
+}
+
+/** Строка сводки: что именно завелось (или уже было) в цепочке. */
+function refLine(label: string, ref: ProvisionResult["server"]): ReactNode {
+  return (
+    <>
+      <span className="muted">{label}:</span> <span className="mono">{ref.label}</span>{" "}
+      <span className={ref.created ? "ok small" : "muted small"}>{ref.created ? "создан" : "уже был"}</span>
+    </>
+  );
+}
+
+function describeProvision(res: ProvisionResult): string {
+  const created = [
+    res.server.created && "сервер",
+    res.node.created && "нода",
+    res.inbound.created && "вход",
+    res.host.created && "endpoint",
+  ].filter(Boolean);
+  if (created.length === 0) return `Локация «${res.node.label}» уже была — состав не изменился.`;
+  return `Локация «${res.node.label}»: заведено — ${created.join(", ")}. Дальше выпустите токен агента.`;
+}
+
+// --- энроллмент из простого режима ------------------------------------------
+
+/**
+ * Bootstrap-токен показывается один раз (в БД лежит только хеш), поэтому окно не
+ * закрывается автоматически. Та же ручка, что и на странице «Ноды и каскады».
+ */
+function AgentEnrollModal({ node, onClose }: { node: { id: string; name: string }; onClose: () => void }) {
+  const [token, setToken] = useState<string | null>(null);
+  const [expiresAt, setExpiresAt] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const issue = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await issueEnrollment(node.id);
+      setToken(res.bootstrapToken);
+      setExpiresAt(res.bootstrapExpiresAt);
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal
+      title={`Токен агента · ${node.name}`}
+      onClose={onClose}
+      footer={
+        <>
+          {error && <span className="err">{error}</span>}
+          <button type="button" className="btn" onClick={onClose}>
+            Закрыть
+          </button>
+          <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void issue()}>
+            {busy ? "Выпускаем…" : token ? "Выпустить заново" : "Выпустить токен"}
+          </button>
+        </>
+      }
+    >
+      <div className="kv">
+        <div>
+          <span className="kv-key">NODE_ID</span>
+          <span className="kv-val mono">{node.id}</span>
+        </div>
+      </div>
+      {token ? (
+        <>
+          <h3 className="form-section">Bootstrap-токен</h3>
+          <pre className="code">{token}</pre>
+          <div className="row-actions">
+            <CopyButton value={token} title="Скопировать токен" />
+          </div>
+          <p className="warn small">
+            Значение видно один раз: в базе лежит только его хеш. Годен до {formatDateTime(expiresAt)}. Пропишите
+            NODE_ID и токен в конфиг агента на сервере и запустите его.
+          </p>
+        </>
+      ) : (
+        <p className="muted small">
+          Выпуск даёт одноразовый токен: агент на сервере обменяет его на постоянный и заберёт конфиг. Прежний
+          невыпущенный токен этой ноды перестанет действовать.
+        </p>
+      )}
+    </Modal>
   );
 }

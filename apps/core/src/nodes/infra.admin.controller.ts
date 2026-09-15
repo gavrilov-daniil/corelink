@@ -13,6 +13,16 @@ import type { Raw } from "./infra.validation.js";
 export class InfraAdminController {
   constructor(private readonly infra: InfraService) {}
 
+  /**
+   * Мастер «Добавить локацию»: одной транзакцией заводит сервер → профиль → ноду →
+   * inbound → host и привязывает inbound к выбранным squad'ам. Идемпотентно по
+   * натуральным ключам, поэтому повторный вызов ничего не дублирует.
+   */
+  @Post("infra/provision")
+  provision(@Body() body: Raw) {
+    return this.infra.provisionLocation(body ?? {});
+  }
+
   // --- серверы ---
 
   @Get("servers")
