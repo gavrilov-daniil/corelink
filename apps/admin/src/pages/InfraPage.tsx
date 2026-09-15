@@ -46,6 +46,7 @@ import Field from "../components/Field";
 import Toggle from "../components/Toggle";
 import StatusBadge from "../components/StatusBadge";
 import CopyButton from "../components/CopyButton";
+import AgentInstall from "../components/AgentInstall";
 import EmptyState from "../components/EmptyState";
 import ErrorBox from "../components/ErrorBox";
 import Loading from "../components/Loading";
@@ -1363,16 +1364,7 @@ function AgentEnrollModal({ node, onClose }: { node: { id: string; name: string 
             Значение видно один раз: в базе лежит только его хеш. Годен до {formatDateTime(expiresAt)}.
           </p>
 
-          <h3 className="form-section">Установка агента на сервер</h3>
-          <pre className="code">{installSnippet(node.id, token)}</pre>
-          <div className="row-actions">
-            <CopyButton value={installSnippet(node.id, token)} title="Скопировать команду" />
-          </div>
-          <p className="muted small">
-            NODE_ID и токен уже подставлены. Замените <span className="mono">&lt;SUB_PUBLIC_HOST&gt;</span> на хост,
-            который отдаёт <span className="mono">/internal/agent/*</span>. Бинарь агента и systemd-юнит —
-            из GitHub Release; подробности в <span className="mono">apps/node-agent/README.md</span>.
-          </p>
+          <AgentInstall nodeId={node.id} token={token} />
         </>
       ) : (
         <p className="muted small">
@@ -1384,27 +1376,3 @@ function AgentEnrollModal({ node, onClose }: { node: { id: string; name: string 
   );
 }
 
-/**
- * Команда установки агента: пишет /etc/node-agent/config.json с подставленными
- * node_id и bootstrap-токеном и запускает сервис. Ключи и дефолты — из
- * apps/node-agent/internal/config/config.go (обязательны control_plane_url,
- * node_id, xray_config_path; reality_private_key_path и state_dir по умолчанию).
- * control_plane_url = хост, отдающий /internal/agent/* (SUB_PUBLIC_HOST), —
- * его знает только деплой, поэтому оставляем плейсхолдером.
- */
-function installSnippet(nodeId: string, token: string): string {
-  return [
-    "# бинарь node-agent и systemd-юнит поставьте из GitHub Release (см. apps/node-agent/README.md),",
-    "# затем пропишите конфиг этой ноды и запустите сервис:",
-    "sudo install -d -m 0755 /etc/node-agent",
-    "sudo tee /etc/node-agent/config.json >/dev/null <<'JSON'",
-    "{",
-    '  "control_plane_url": "https://<SUB_PUBLIC_HOST>",',
-    `  "node_id": "${nodeId}",`,
-    `  "bootstrap_token": "${token}",`,
-    '  "xray_config_path": "/etc/xray/config.json"',
-    "}",
-    "JSON",
-    "sudo systemctl enable --now node-agent",
-  ].join("\n");
-}

@@ -29,6 +29,7 @@ import Modal from "../components/Modal";
 import Field from "../components/Field";
 import Toggle from "../components/Toggle";
 import CopyButton from "../components/CopyButton";
+import AgentInstall from "../components/AgentInstall";
 import StatusBadge from "../components/StatusBadge";
 import EmptyState from "../components/EmptyState";
 import ErrorBox from "../components/ErrorBox";
@@ -495,6 +496,8 @@ function EnrollmentModal({ node, onClose }: { node: Node; onClose: () => void })
           <p className="warn small">
             Значение видно один раз: в базе лежит только его хеш. Годен до {formatDateTime(expiresAt)}.
           </p>
+
+          <AgentInstall nodeId={node.id} token={token} />
         </>
       ) : (
         <p className="muted small">
