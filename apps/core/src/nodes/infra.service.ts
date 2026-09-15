@@ -50,6 +50,29 @@ export interface Upserted<T> {
   rebuilt?: RebuildInfo[];
 }
 
+/** Одна созданная (или переиспользованная) сущность в мастере «Добавить локацию». */
+export interface ProvisionedRef {
+  id: string;
+  label: string;
+  /** true — строку завёл этот вызов; false — она уже была и переиспользована. */
+  created: boolean;
+}
+
+/**
+ * Итог мастера: вся цепочка сервер→профиль→нода→inbound→host + привязки к squad'ам,
+ * плюс пересборка. По `created`/`attached` фронт показывает, что реально появилось,
+ * а что уже было (повторный прогон мастера идемпотентен).
+ */
+export interface ProvisionResult {
+  server: ProvisionedRef;
+  configProfile: ProvisionedRef;
+  node: ProvisionedRef;
+  inbound: ProvisionedRef;
+  host: ProvisionedRef;
+  squads: Array<{ id: string; name: string; attached: boolean }>;
+  rebuilt: RebuildInfo[];
+}
+
 const PG_UNIQUE_VIOLATION = "23505";
 
 /**
@@ -746,6 +769,200 @@ export class InfraService {
     return this.rebuildNodes(await this.nodesByInboundIds([...new Set([...before, ...inboundIds])]));
   }
 
+  // --- мастер «Добавить локацию» ---------------------------------------------
+
+  /**
+   * Заводит всю цепочку одной локации за один вызов: сервер → config-профиль →
+   * нода → inbound → host, плюс привязка inbound'а к выбранным squad'ам. Это то,
+   * что оператор иначе собирал бы руками из пяти форм в правильном порядке, зная
+   * про «1 профиль = 1 нода», про то, что host — это endpoint подписки, а squad —
+   * access-control.
+   *
+   * Три сквозных правила.
+   *   1. Каждый шаг — find-or-create по натуральному ключу (тому же уникальному
+   *      индексу, что и у импортёра). Повторный прогон мастера ничего не дублирует
+   *      и ничего не затирает: существующую строку переиспользуем как есть, менять
+   *      её поля — дело обычных форм, а не мастера. Барьер — индекс БД, не SELECT.
+   *   2. Все записи в БД идут ОДНОЙ транзакцией: обрыв на середине не оставляет
+   *      осиротевших сервер/профиль без ноды. Пересборка desired-state — уже ПОСЛЕ
+   *      коммита (NodeStateService.rebuild читает по своему соединению и не увидел бы
+   *      незакоммиченных строк), ровно как во всех остальных create*.
+   *   3. Reality-ключи новой ноды НЕ проставляются: приватник генерится на ноде и
+   *      приезжает публичной частью при энроллменте агента, тогда же попадая в
+   *      inbound и host этой ноды (NodeIdentityService.applyRealityIdentity). До
+   *      энроллмента inbound честно «ждёт энроллмента», а bootstrap-токен оператор
+   *      выпускает отдельным шагом (POST /nodes/:id/enrollment) — чтобы повторный
+   *      прогон мастера не инвалидировал уже розданный токен.
+   */
+  async provisionLocation(body: Raw): Promise<ProvisionResult> {
+    const v = this.provisionValues(body);
+    const squads = await this.assertSquadsExist(v.squadIds);
+
+    const built = await this.db.transaction(async (tx) => {
+      // сервер: ключ (org, hostname)
+      const serverKey = and(eq(schema.server.orgId, this.org), eq(schema.server.hostname, v.server.hostname))!;
+      const serverIns = await tx
+        .insert(schema.server)
+        .values(v.server)
+        .onConflictDoNothing({ target: [schema.server.orgId, schema.server.hostname] })
+        .returning();
+      const serverCreated = serverIns.length > 0;
+      const serverRow = serverIns[0] ?? (await tx.select().from(schema.server).where(serverKey).limit(1))[0];
+      if (!serverRow) throw new Error("provision: сервер не найден после конфликта");
+
+      // config-профиль: ключ (org, name)
+      const profileKey = and(eq(schema.configProfile.orgId, this.org), eq(schema.configProfile.name, v.profileName))!;
+      const profileIns = await tx
+        .insert(schema.configProfile)
+        .values({ orgId: this.org, name: v.profileName, baseJson: {} })
+        .onConflictDoNothing({ target: [schema.configProfile.orgId, schema.configProfile.name] })
+        .returning();
+      const profileCreated = profileIns.length > 0;
+      const profileRow =
+        profileIns[0] ?? (await tx.select().from(schema.configProfile).where(profileKey).limit(1))[0];
+      if (!profileRow) throw new Error("provision: профиль не найден после конфликта");
+
+      // нода: ключ — профиль (node_config_profile_uq, «1 профиль = 1 нода»)
+      const nodeIns = await tx
+        .insert(schema.node)
+        .values({
+          orgId: this.org,
+          serverId: serverRow.id,
+          configProfileId: profileRow.id,
+          name: v.node.name,
+          roles: v.node.roles,
+          status: "provisioning",
+        })
+        .onConflictDoNothing({ target: schema.node.configProfileId })
+        .returning();
+      const nodeCreated = nodeIns.length > 0;
+      const nodeRow =
+        nodeIns[0] ??
+        (await tx.select().from(schema.node).where(eq(schema.node.configProfileId, profileRow.id)).limit(1))[0];
+      if (!nodeRow) throw new Error("provision: нода не найдена после конфликта");
+
+      // inbound: ключ (профиль, tag)
+      const inboundKey = and(
+        eq(schema.inbound.configProfileId, profileRow.id),
+        eq(schema.inbound.tag, v.inbound.tag),
+      )!;
+      const inboundIns = await tx
+        .insert(schema.inbound)
+        .values({ orgId: this.org, configProfileId: profileRow.id, ...v.inbound })
+        .onConflictDoNothing({ target: [schema.inbound.configProfileId, schema.inbound.tag] })
+        .returning();
+      const inboundCreated = inboundIns.length > 0;
+      const inboundRow = inboundIns[0] ?? (await tx.select().from(schema.inbound).where(inboundKey).limit(1))[0];
+      if (!inboundRow) throw new Error("provision: inbound не найден после конфликта");
+
+      // host: ключ (inbound, address, port)
+      const hostKey = and(
+        eq(schema.host.inboundId, inboundRow.id),
+        eq(schema.host.address, v.host.address),
+        eq(schema.host.port, v.host.port),
+      )!;
+      const hostIns = await tx
+        .insert(schema.host)
+        .values({ orgId: this.org, inboundId: inboundRow.id, nodeId: nodeRow.id, ...v.host })
+        .onConflictDoNothing({ target: [schema.host.inboundId, schema.host.address, schema.host.port] })
+        .returning();
+      const hostCreated = hostIns.length > 0;
+      const hostRow = hostIns[0] ?? (await tx.select().from(schema.host).where(hostKey).limit(1))[0];
+      if (!hostRow) throw new Error("provision: host не найден после конфликта");
+
+      // squad'ы: ДОБАВЛЯЕМ inbound в набор (не заменяем — иначе снесли бы чужие).
+      const attached: Record<string, boolean> = {};
+      for (const s of squads) {
+        const link = await tx
+          .insert(schema.squadInbound)
+          .values({ squadId: s.id, inboundId: inboundRow.id })
+          .onConflictDoNothing({ target: [schema.squadInbound.squadId, schema.squadInbound.inboundId] })
+          .returning();
+        attached[s.id] = link.length > 0;
+      }
+
+      return {
+        server: { id: serverRow.id, label: serverRow.hostname, created: serverCreated },
+        configProfile: { id: profileRow.id, label: profileRow.name, created: profileCreated },
+        node: { id: nodeRow.id, label: nodeRow.name, created: nodeCreated },
+        inbound: { id: inboundRow.id, label: inboundRow.tag, created: inboundCreated },
+        host: { id: hostRow.id, label: hostRow.remark, created: hostCreated },
+        attached,
+      };
+    });
+
+    // Пересборка — после коммита: сборщик читает по своему соединению.
+    const rebuilt = await this.rebuildNodes([built.node.id]);
+
+    return {
+      server: built.server,
+      configProfile: built.configProfile,
+      node: built.node,
+      inbound: built.inbound,
+      host: built.host,
+      squads: squads.map((s) => ({ id: s.id, name: s.name, attached: built.attached[s.id] ?? false })),
+      rebuilt,
+    };
+  }
+
+  /**
+   * Разбор и валидация входа мастера. Чистая (без БД): та же пополевая проверка, что
+   * и у форм, плюс дефолты общего случая (exit-нода vless+reality, tcp, vision,
+   * host = основной IP), чтобы оператор задавал минимум — имя, IP, sni.
+   */
+  private provisionValues(body: Raw) {
+    const name = str(body, "name", { required: true, max: 128 })!;
+    const primaryIp = ipStr(body, "primaryIp", { required: true })!;
+    const hostname = hostnameStr(body, "hostname") ?? primaryIp;
+
+    const server = {
+      orgId: this.org,
+      hostname,
+      primaryIp,
+      extraIps: ipArray(body, "extraIps") ?? [],
+      country: nullableStr(body, "country", { max: 8, upper: true }) ?? null,
+      sshRef: nullableStr(body, "sshRef", { max: 256 }) ?? null,
+    };
+
+    const roles = roleArray(body, "roles") ?? ["exit"];
+
+    const tag = has(body, "tag")
+      ? tagStr(body, "tag", { required: true })!
+      : tagStr({ tag: defaultInboundTag(name) }, "tag", { required: true })!;
+    const network = enumOf(body, "network", INBOUND_NETWORKS) ?? "tcp";
+    const flow = enumOf(body, "flow", INBOUND_FLOWS, { allowEmpty: true }) ?? "xtls-rprx-vision";
+    const sni = str(body, "sni", { required: true, max: 253 })!;
+    const fingerprint = enumOf(body, "fingerprint", FINGERPRINTS) ?? "firefox";
+    const port = portNum(body, "port") ?? 443;
+    const shortIds = shortIdArray(body, "shortIds") ?? [];
+    const inbound = { tag, protocol: "vless", network, security: "reality", port, flow, sni, fingerprint, shortIds };
+    // security=reality без sni и vision не на tcp ловим здесь, а не сборкой конфига ноды
+    assertInboundShape({ security: "reality", sni, network, flow });
+
+    const host = {
+      remark: str(body, "hostRemark", { max: 128 }) ?? name,
+      address: addressStr(body, "hostAddress") ?? primaryIp,
+      port: portNum(body, "hostPort") ?? port,
+      sni,
+      fingerprint,
+      flow,
+    };
+
+    return { server, profileName: name, node: { name, roles }, inbound, host, squadIds: idList(body, "squadIds") };
+  }
+
+  /** squad'ы для привязки существуют в этом org? Пустой список — норма (можно завести локацию без выдачи). */
+  private async assertSquadsExist(ids: string[]): Promise<Array<{ id: string; name: string }>> {
+    if (ids.length === 0) return [];
+    const rows = await this.db
+      .select({ id: schema.squad.id, name: schema.squad.name })
+      .from(schema.squad)
+      .where(and(eq(schema.squad.orgId, this.org), inArray(schema.squad.id, ids)));
+    const missing = ids.filter((id) => !rows.some((r) => r.id === id));
+    if (missing.length > 0) bad(`squadIds: не найдены ${missing.join(", ")}`);
+    return rows;
+  }
+
   // --- импорт: upsert по натуральному ключу ----------------------------------
 
   /**
@@ -1049,4 +1266,26 @@ function assertNotEmpty(values: Record<string, unknown>): void {
 
 function isUniqueViolation(err: unknown): boolean {
   return typeof err === "object" && err !== null && (err as { code?: string }).code === PG_UNIQUE_VIOLATION;
+}
+
+/**
+ * Тег inbound'а по умолчанию из имени локации: оператор мастера про теги не знает,
+ * а на тег ссылаются каскады и селектор балансера. Приводим к допустимому TAG_RE
+ * (буквы/цифры/. _ -), режем до 64. Итог всё равно проходит через tagStr — если
+ * из имени вышло что-то негодное, оператор увидит обычную ошибку валидации.
+ */
+function defaultInboundTag(name: string): string {
+  const slug = name
+    .toUpperCase()
+    .replace(/[^A-Z0-9._-]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^[._-]+/, "");
+  return `VLESS_REALITY_${slug || "NODE"}`.slice(0, 64);
+}
+
+/** Список uuid из тела: отсутствие — пустой список, дубли схлопываются, мусор — 400. */
+function idList(body: Raw, key: string): string[] {
+  if (!has(body, key)) return [];
+  if (!Array.isArray(body[key])) bad(`${key}: ожидается массив uuid`);
+  return [...new Set((body[key] as unknown[]).map((v) => requireUuid(String(v), key)))];
 }

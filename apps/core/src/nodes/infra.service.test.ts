@@ -364,6 +364,93 @@ describe("удаление под ссылками", () => {
   });
 });
 
+describe("мастер «Добавить локацию»", () => {
+  it("одним вызовом поднимает сервер→профиль→ноду→inbound→host и сразу даёт desired-state", async () => {
+    const result = await infra.provisionLocation({
+      name: "de1-exit",
+      primaryIp: "203.0.113.10",
+      country: "DE",
+      sni: "ads.x5.ru",
+    });
+
+    assert.equal(result.server.created, true);
+    assert.equal(result.node.created, true);
+    assert.equal(result.inbound.created, true);
+    assert.equal(result.host.created, true);
+    assert.equal(result.inbound.label, "VLESS_REALITY_DE1-EXIT");
+    assert.equal(result.rebuilt.length, 1);
+    assert.equal(result.rebuilt[0].changed, true);
+
+    // desired-state собран сразу и содержит наш inbound (плюс служебный api)
+    assert.deepEqual(await inboundTags(result.node.id), ["VLESS_REALITY_DE1-EXIT", "api"].sort());
+
+    // host привязан к inbound и ноде; pbk пустой — ключ приедет при энроллменте
+    const [host] = await db.select().from(schema.host).where(eq(schema.host.id, result.host.id));
+    assert.equal(host.nodeId, result.node.id);
+    assert.equal(host.inboundId, result.inbound.id);
+    assert.equal(host.address, "203.0.113.10");
+    assert.equal(host.pbk, null);
+  });
+
+  it("повторный прогон идемпотентен: ничего не дублирует и не затирает", async () => {
+    const body = { name: "fi1-exit", primaryIp: "203.0.113.20", sni: "ads.x5.ru" };
+    const first = await infra.provisionLocation(body);
+    const second = await infra.provisionLocation(body);
+
+    assert.equal(second.server.created, false);
+    assert.equal(second.node.created, false);
+    assert.equal(second.inbound.created, false);
+    assert.equal(second.host.created, false);
+    assert.equal(first.node.id, second.node.id);
+
+    const servers = await db.select().from(schema.server).where(eq(schema.server.hostname, "203.0.113.20"));
+    assert.equal(servers.length, 1, "второй прогон не должен заводить второй сервер");
+  });
+
+  it("привязывает inbound к squad'у, и подписчик squad'а появляется в desired-state", async () => {
+    const squad = await infra.createSquad({ name: "базовый" });
+    const subscriber = await createSubscriber(db);
+    const subscription = await createSubscription(db, subscriber.id);
+    await db.insert(schema.subscriptionSquad).values({ subscriptionId: subscription.id, squadId: squad.id });
+
+    const result = await infra.provisionLocation({
+      name: "de2-exit",
+      primaryIp: "203.0.113.11",
+      sni: "ads.x5.ru",
+      squadIds: [squad.id],
+    });
+
+    assert.equal(result.squads.length, 1);
+    assert.equal(result.squads[0].attached, true);
+
+    const desired = await state.getDesiredState(result.node.id);
+    assert.ok(
+      desired.users.some((u) => u.uuid === subscription.vlessUuid),
+      "подписчик привязанного squad'а должен быть в desired-state ноды",
+    );
+  });
+
+  it("security=reality без sni отвергается на входе, а не сборкой конфига", async () => {
+    await assert.rejects(
+      () => infra.provisionLocation({ name: "no-sni", primaryIp: "203.0.113.12" }),
+      (e) => status(e) === 400 && /sni/.test((e as Error).message),
+    );
+  });
+
+  it("несуществующий squad отвергается", async () => {
+    await assert.rejects(
+      () =>
+        infra.provisionLocation({
+          name: "bad-squad",
+          primaryIp: "203.0.113.13",
+          sni: "ads.x5.ru",
+          squadIds: ["11111111-1111-1111-1111-111111111111"],
+        }),
+      (e) => status(e) === 400 && /squad/.test((e as Error).message),
+    );
+  });
+});
+
 describe("секреты наружу не отдаются", () => {
   it("ssh_ref не попадает в список серверов", async () => {
     await server({ sshRef: "vault://projects/vpn/ssh/de1" });

@@ -546,6 +546,51 @@ export const updateSquad = (id: string, body: { name?: string; inboundIds?: stri
 export const deleteSquad = (id: string) =>
   request<{ ok: boolean; rebuilt: RebuildInfo[] }>(`/api/admin/squads/${id}`, del());
 
+// --- Мастер «Добавить локацию» ----------------------------------------------
+// Одна ручка заводит всю цепочку сервер→профиль→нода→inbound→host и привязывает
+// inbound к squad'ам. Идемпотентна по натуральным ключам: повторный прогон с теми
+// же данными ничего не дублирует.
+
+/** Одна созданная (или переиспользованная) сущность цепочки. */
+export interface ProvisionedRef {
+  id: string;
+  label: string;
+  /** true — строку завёл этот вызов; false — уже была и переиспользована. */
+  created: boolean;
+}
+
+export interface ProvisionResult {
+  server: ProvisionedRef;
+  configProfile: ProvisionedRef;
+  node: ProvisionedRef;
+  inbound: ProvisionedRef;
+  host: ProvisionedRef;
+  squads: { id: string; name: string; attached: boolean }[];
+  rebuilt: RebuildInfo[];
+}
+
+export interface ProvisionInput {
+  /** Имя локации: станет именем ноды, профиля и основой тега inbound'а. */
+  name: string;
+  primaryIp: string;
+  /** Домен-маскировка Reality (обязателен). */
+  sni: string;
+  country?: string | null;
+  port?: number;
+  /** По умолчанию = primaryIp. */
+  hostname?: string;
+  /** По умолчанию VLESS_REALITY_<ИМЯ>. */
+  tag?: string;
+  /** По умолчанию ["exit"]. */
+  roles?: string[];
+  fingerprint?: string;
+  /** В какие squad'ы добавить inbound (доступ подписок). */
+  squadIds?: string[];
+}
+
+export const provisionLocation = (body: ProvisionInput) =>
+  request<ProvisionResult>("/api/admin/infra/provision", post(body));
+
 // --- Подписчики -------------------------------------------------------------
 
 export interface Subscriber {
