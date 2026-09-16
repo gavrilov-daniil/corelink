@@ -611,6 +611,14 @@ export interface ProvisionInput {
   fingerprint?: string;
   /** В какие squad'ы добавить inbound (доступ подписок). */
   squadIds?: string[];
+  /** SSH-доступ к серверу для последующей авто-настройки; секреты шифруются в БД, наружу не отдаются. */
+  sshAuthType?: SshAuthType;
+  sshUser?: string | null;
+  sshPort?: number | null;
+  sshRef?: string | null;
+  sshPassword?: string;
+  sshPrivateKey?: string;
+  sshPassphrase?: string;
 }
 
 export const provisionLocation = (body: ProvisionInput) =>

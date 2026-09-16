@@ -575,20 +575,136 @@ function toInt(value: string, fallback = 0): number {
   return Number.isInteger(n) ? n : fallback;
 }
 
+interface SshAccessValue {
+  authType: SshAuthType;
+  sshUser: string;
+  sshPort: string;
+  sshRef: string;
+  sshPassword: string;
+  sshPrivateKey: string;
+  sshPassphrase: string;
+}
+
+function emptySsh(row?: Server): SshAccessValue {
+  return {
+    authType: row?.sshAuthType ?? "vault_ref",
+    sshUser: row?.sshUser ?? "",
+    sshPort: row?.sshPort != null ? String(row.sshPort) : "",
+    sshRef: "",
+    sshPassword: "",
+    sshPrivateKey: "",
+    sshPassphrase: "",
+  };
+}
+
+/** SSH-часть тела запроса. vault_ref → только ссылка; иначе — юзер/порт/секрет. Пустые поля не отправляем. */
+function sshBody(v: SshAccessValue): Record<string, unknown> {
+  if (v.authType === "vault_ref") {
+    return { sshAuthType: v.authType, ...(v.sshRef.trim() ? { sshRef: v.sshRef.trim() } : {}) };
+  }
+  return {
+    sshAuthType: v.authType,
+    sshUser: orNull(v.sshUser),
+    sshPort: v.sshPort.trim() ? Number(v.sshPort) : null,
+    ...(v.sshPassword ? { sshPassword: v.sshPassword } : {}),
+    ...(v.sshPrivateKey ? { sshPrivateKey: v.sshPrivateKey } : {}),
+    ...(v.sshPassphrase ? { sshPassphrase: v.sshPassphrase } : {}),
+  };
+}
+
+/** Поля SSH-доступа: способ (vault-ссылка / пароль / ключ) и соответствующие поля. Общие для формы сервера и мастера. */
+function SshAccessFields({
+  value,
+  onChange,
+  hasSecret,
+  hasRef,
+}: {
+  value: SshAccessValue;
+  onChange: (patch: Partial<SshAccessValue>) => void;
+  hasSecret?: boolean;
+  hasRef?: boolean;
+}) {
+  const secretHint = hasSecret ? "задан; пустое поле не меняет" : undefined;
+  return (
+    <>
+      <Field label="Способ" hint="пароль и ключ шифруются в БД; vault — только ссылка, платформа по ней не ходит">
+        <select value={value.authType} onChange={(e) => onChange({ authType: e.target.value as SshAuthType })}>
+          <option value="vault_ref">Ссылка на vault</option>
+          <option value="password">Пароль</option>
+          <option value="key">Приватный ключ</option>
+        </select>
+      </Field>
+
+      {value.authType === "vault_ref" ? (
+        <Field
+          label="Ссылка на SSH-доступ в vault"
+          hint={hasRef ? "ссылка задана; пустое поле её не меняет" : "именно ссылка, не ключ"}
+        >
+          <input
+            value={value.sshRef}
+            onChange={(e) => onChange({ sshRef: e.target.value })}
+            placeholder="vault://projects/vpn/ssh/de1"
+          />
+        </Field>
+      ) : (
+        <>
+          <div className="grid-2">
+            <Field label="SSH-пользователь" hint="по умолчанию root">
+              <input value={value.sshUser} onChange={(e) => onChange({ sshUser: e.target.value })} placeholder="root" />
+            </Field>
+            <Field label="SSH-порт" hint="по умолчанию 22">
+              <input
+                value={value.sshPort}
+                onChange={(e) => onChange({ sshPort: e.target.value })}
+                inputMode="numeric"
+                placeholder="22"
+              />
+            </Field>
+          </div>
+          {value.authType === "password" ? (
+            <Field label="Пароль" hint={secretHint}>
+              <input
+                type="password"
+                value={value.sshPassword}
+                onChange={(e) => onChange({ sshPassword: e.target.value })}
+                autoComplete="new-password"
+                placeholder={hasSecret ? "••••••••" : ""}
+              />
+            </Field>
+          ) : (
+            <>
+              <Field label="Приватный ключ" hint={secretHint ?? "PEM-формат (OpenSSH / RSA)"}>
+                <textarea
+                  value={value.sshPrivateKey}
+                  onChange={(e) => onChange({ sshPrivateKey: e.target.value })}
+                  rows={6}
+                  className="mono"
+                  placeholder={hasSecret ? "ключ задан; вставьте новый, чтобы заменить" : "-----BEGIN OPENSSH PRIVATE KEY-----"}
+                />
+              </Field>
+              <Field label="Passphrase ключа" hint="если ключ без пароля — оставьте пустым">
+                <input
+                  type="password"
+                  value={value.sshPassphrase}
+                  onChange={(e) => onChange({ sshPassphrase: e.target.value })}
+                  autoComplete="new-password"
+                  placeholder={hasSecret ? "••••••••" : ""}
+                />
+              </Field>
+            </>
+          )}
+        </>
+      )}
+    </>
+  );
+}
+
 function ServerModal({ row, onClose, onSaved }: { row?: Server; onClose: () => void; onSaved: SavedHandler }) {
   const [hostname, setHostname] = useState(row?.hostname ?? "");
   const [primaryIp, setPrimaryIp] = useState(row?.primaryIp ?? "");
   const [extraIps, setExtraIps] = useState((row?.extraIps ?? []).join(", "));
   const [country, setCountry] = useState(row?.country ?? "");
-  const [authType, setAuthType] = useState<SshAuthType>(row?.sshAuthType ?? "vault_ref");
-  const [sshUser, setSshUser] = useState(row?.sshUser ?? "");
-  const [sshPort, setSshPort] = useState(row?.sshPort != null ? String(row.sshPort) : "");
-  const [sshRef, setSshRef] = useState("");
-  const [sshPassword, setSshPassword] = useState("");
-  const [sshPrivateKey, setSshPrivateKey] = useState("");
-  const [sshPassphrase, setSshPassphrase] = useState("");
-
-  const secretHint = row?.hasSshSecret ? "задан; пустое поле не меняет" : undefined;
+  const [ssh, setSsh] = useState<SshAccessValue>(() => emptySsh(row));
 
   return (
     <FormShell
@@ -600,24 +716,12 @@ function ServerModal({ row, onClose, onSaved }: { row?: Server; onClose: () => v
       onDelete={row ? async () => void (await deleteServer(row.id)) : undefined}
       onSubmit={async () => {
         // Секреты: пустое поле при правке ничего не меняет (значение мы не показываем).
-        const secret =
-          authType === "vault_ref"
-            ? {}
-            : {
-                sshUser: orNull(sshUser),
-                sshPort: sshPort.trim() ? Number(sshPort) : null,
-                ...(sshPassword ? { sshPassword } : {}),
-                ...(sshPrivateKey ? { sshPrivateKey } : {}),
-                ...(sshPassphrase ? { sshPassphrase } : {}),
-              };
         const body = {
           hostname: hostname.trim(),
           primaryIp: primaryIp.trim(),
           extraIps: toList(extraIps),
           country: orNull(country),
-          sshAuthType: authType,
-          ...(authType === "vault_ref" && sshRef.trim() ? { sshRef: sshRef.trim() } : {}),
-          ...secret,
+          ...sshBody(ssh),
         };
         if (row) await updateServer(row.id, body);
         else await createServer(body);
@@ -642,65 +746,12 @@ function ServerModal({ row, onClose, onSaved }: { row?: Server; onClose: () => v
       </div>
 
       <h3 className="form-section">SSH-доступ</h3>
-      <Field label="Способ" hint="пароль и ключ шифруются в БД; vault — только ссылка, платформа по ней не ходит">
-        <select value={authType} onChange={(e) => setAuthType(e.target.value as SshAuthType)}>
-          <option value="vault_ref">Ссылка на vault</option>
-          <option value="password">Пароль</option>
-          <option value="key">Приватный ключ</option>
-        </select>
-      </Field>
-
-      {authType === "vault_ref" ? (
-        <Field
-          label="Ссылка на SSH-доступ в vault"
-          hint={row?.hasSshRef ? "ссылка задана; пустое поле её не меняет" : "именно ссылка, не ключ"}
-        >
-          <input value={sshRef} onChange={(e) => setSshRef(e.target.value)} placeholder="vault://projects/vpn/ssh/de1" />
-        </Field>
-      ) : (
-        <>
-          <div className="grid-2">
-            <Field label="SSH-пользователь" hint="по умолчанию root">
-              <input value={sshUser} onChange={(e) => setSshUser(e.target.value)} placeholder="root" />
-            </Field>
-            <Field label="SSH-порт" hint="по умолчанию 22">
-              <input value={sshPort} onChange={(e) => setSshPort(e.target.value)} inputMode="numeric" placeholder="22" />
-            </Field>
-          </div>
-          {authType === "password" ? (
-            <Field label="Пароль" hint={secretHint}>
-              <input
-                type="password"
-                value={sshPassword}
-                onChange={(e) => setSshPassword(e.target.value)}
-                autoComplete="new-password"
-                placeholder={row?.hasSshSecret ? "••••••••" : ""}
-              />
-            </Field>
-          ) : (
-            <>
-              <Field label="Приватный ключ" hint={secretHint ?? "PEM-формат (OpenSSH / RSA)"}>
-                <textarea
-                  value={sshPrivateKey}
-                  onChange={(e) => setSshPrivateKey(e.target.value)}
-                  rows={6}
-                  className="mono"
-                  placeholder={row?.hasSshSecret ? "ключ задан; вставьте новый, чтобы заменить" : "-----BEGIN OPENSSH PRIVATE KEY-----"}
-                />
-              </Field>
-              <Field label="Passphrase ключа" hint="если ключ без пароля — оставьте пустым">
-                <input
-                  type="password"
-                  value={sshPassphrase}
-                  onChange={(e) => setSshPassphrase(e.target.value)}
-                  autoComplete="new-password"
-                  placeholder={row?.hasSshSecret ? "••••••••" : ""}
-                />
-              </Field>
-            </>
-          )}
-        </>
-      )}
+      <SshAccessFields
+        value={ssh}
+        onChange={(p) => setSsh((s) => ({ ...s, ...p }))}
+        hasSecret={row?.hasSshSecret}
+        hasRef={row?.hasSshRef}
+      />
     </FormShell>
   );
 }
@@ -1241,6 +1292,7 @@ function LocationWizard({
   const [sni, setSni] = useState(() => commonSni(inbounds));
   const [port, setPort] = useState("443");
   const [selectedSquads, setSelectedSquads] = useState<string[]>([]);
+  const [ssh, setSsh] = useState<SshAccessValue>(() => emptySsh());
   // продвинутое — под <details>, с дефолтами общего случая
   const [hostname, setHostname] = useState("");
   const [tag, setTag] = useState("");
@@ -1250,6 +1302,19 @@ function LocationWizard({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ProvisionResult | null>(null);
+  const [sshCheck, setSshCheck] = useState<CheckState | null>(null);
+
+  const sshConfigured =
+    ssh.authType === "vault_ref" ? ssh.sshRef.trim() !== "" : Boolean(ssh.sshPassword || ssh.sshPrivateKey);
+
+  const checkSsh = async (serverId: string) => {
+    setSshCheck({ pending: true });
+    try {
+      setSshCheck({ pending: false, ...(await checkServerSsh(serverId)) });
+    } catch (e) {
+      setSshCheck({ pending: false, ok: false, detail: errorMessage(e) });
+    }
+  };
 
   const toggleSquad = (id: string, on: boolean) =>
     setSelectedSquads((prev) => (on ? [...new Set([...prev, id])] : prev.filter((x) => x !== id)));
@@ -1271,6 +1336,7 @@ function LocationWizard({
         roles,
         fingerprint,
         squadIds: selectedSquads,
+        ...sshBody(ssh),
       });
       setResult(res);
       onProvisioned(describeProvision(res));
@@ -1312,6 +1378,21 @@ function LocationWizard({
         </ul>
         {result.squads.length > 0 && (
           <p className="small">Выдаётся в squad'ах: {result.squads.map((s) => s.name).join(", ")}.</p>
+        )}
+        {sshConfigured && (
+          <div className="provision-ssh-check">
+            <button
+              type="button"
+              className="btn btn-sm"
+              disabled={sshCheck?.pending}
+              onClick={() => void checkSsh(result.server.id)}
+            >
+              {sshCheck?.pending ? "Проверяем доступ…" : "Проверить SSH-доступ"}
+            </button>
+            {sshCheck && !sshCheck.pending && (
+              <span className={sshCheck.ok ? "small ok" : "small err"}> {sshCheck.detail}</span>
+            )}
+          </div>
         )}
         <p className="muted small">
           Reality-ключи проставятся автоматически после энроллмента агента — до этого вход помечен «ждёт агента».
@@ -1379,6 +1460,9 @@ function LocationWizard({
           ))}
         </div>
       )}
+
+      <h3 className="form-section">SSH-доступ (для авто-настройки)</h3>
+      <SshAccessFields value={ssh} onChange={(p) => setSsh((s) => ({ ...s, ...p }))} />
 
       <details className="advanced">
         <summary>Продвинутые параметры</summary>

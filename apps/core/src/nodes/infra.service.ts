@@ -146,23 +146,33 @@ export class InfraService {
     return patch;
   }
 
-  private serverValues(body: Raw) {
+  /**
+   * SSH-поля сервера: тип доступа, пользователь/порт, ссылка в vault и зашифрованный
+   * секрет. Вынесено, чтобы форма сервера и мастер локации заводили доступ одинаково.
+   */
+  private sshServerFields(body: Raw) {
     const authType = (enumOf(body, "sshAuthType", SSH_AUTH_TYPES) ?? "vault_ref") as SshAuthType;
     const secret = pruneSshSecret(
       Object.fromEntries(Object.entries(this.sshSecretInput(body)).filter(([, v]) => v !== "")),
       authType,
     );
     return {
-      orgId: this.org,
-      hostname: hostnameStr(body, "hostname", { required: true })!,
-      primaryIp: ipStr(body, "primaryIp", { required: true })!,
-      extraIps: ipArray(body, "extraIps") ?? [],
-      country: nullableStr(body, "country", { max: 8, upper: true }) ?? null,
       sshAuthType: authType,
       sshUser: sshUserStr(body, "sshUser") ?? null,
       sshPort: portNum(body, "sshPort") ?? null,
       sshRef: nullableStr(body, "sshRef", { max: 256 }) ?? null,
       sshSecret: encryptCredentials(secret, this.cfg.secretsMasterKey),
+    };
+  }
+
+  private serverValues(body: Raw) {
+    return {
+      orgId: this.org,
+      hostname: hostnameStr(body, "hostname", { required: true })!,
+      primaryIp: ipStr(body, "primaryIp", { required: true })!,
+      extraIps: ipArray(body, "extraIps") ?? [],
+      country: nullableStr(body, "country", { max: 8, upper: true }) ?? null,
+      ...this.sshServerFields(body),
       capabilities: obj(body, "capabilities") ?? {},
     };
   }
@@ -1035,7 +1045,7 @@ export class InfraService {
       primaryIp,
       extraIps: ipArray(body, "extraIps") ?? [],
       country: nullableStr(body, "country", { max: 8, upper: true }) ?? null,
-      sshRef: nullableStr(body, "sshRef", { max: 256 }) ?? null,
+      ...this.sshServerFields(body),
     };
 
     const roles = roleArray(body, "roles") ?? ["exit"];
