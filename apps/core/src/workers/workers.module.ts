@@ -21,6 +21,7 @@ import { PaymentReconcileJob } from "./jobs/payment-reconcile.job.js";
 import { AbuseScanJob } from "./jobs/abuse-scan.job.js";
 import { AiSuggestJob } from "./jobs/ai-suggest.job.js";
 import { MaintenanceJob } from "./jobs/maintenance.job.js";
+import { ProvisionResumeJob } from "./jobs/provision-resume.job.js";
 
 @Module({
   imports: [
@@ -47,6 +48,7 @@ import { MaintenanceJob } from "./jobs/maintenance.job.js";
     AbuseScanJob,
     AiSuggestJob,
     MaintenanceJob,
+    ProvisionResumeJob,
     JobRegistry,
   ],
   exports: [QueueService, SchedulerService, JobRegistry],

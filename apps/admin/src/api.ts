@@ -624,6 +624,32 @@ export interface ProvisionInput {
 export const provisionLocation = (body: ProvisionInput) =>
   request<ProvisionResult>("/api/admin/infra/provision", post(body));
 
+// --- авто-настройка сервера по SSH ------------------------------------------
+
+export interface ProvisionRun {
+  id: string;
+  serverId: string;
+  nodeId: string | null;
+  kind: string;
+  status: "queued" | "running" | "success" | "failed";
+  log: string;
+  error: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  createdAt: string;
+}
+
+export const provisionServer = (id: string) =>
+  request<{ runId: string; already: boolean }>(`/api/admin/servers/${id}/provision`, post());
+
+export const reprovisionServer = (id: string) =>
+  request<{ runId: string; already: boolean }>(`/api/admin/servers/${id}/reprovision`, post());
+
+export const getProvisionRun = (id: string) => request<ProvisionRun>(`/api/admin/provision-runs/${id}`);
+
+export const listProvisionRuns = (serverId: string) =>
+  request<ProvisionRun[]>(`/api/admin/servers/${serverId}/provision-runs`);
+
 // --- Подписчики -------------------------------------------------------------
 
 export interface Subscriber {

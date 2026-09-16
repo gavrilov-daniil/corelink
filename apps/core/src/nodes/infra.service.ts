@@ -1,11 +1,12 @@
 import { ConflictException, Inject, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { schema, type Database } from "@corelink/db";
-import { decryptCredentials, encryptCredentials } from "@corelink/core-kit";
+import { encryptCredentials } from "@corelink/core-kit";
 import { DB } from "../db/db.module.js";
 import { loadConfig } from "../config.js";
 import { NodeStateService } from "./node-state.service.js";
-import { probeSsh, type SshProbeCreds } from "./ssh-probe.js";
+import { probeSsh } from "./ssh-probe.js";
+import { resolveServerSsh } from "./server-ssh.js";
 import {
   FINGERPRINTS,
   INBOUND_FLOWS,
@@ -248,33 +249,9 @@ export class InfraService {
   }
 
   private async runSshProbe(row: typeof schema.server.$inferSelect): Promise<{ ok: boolean; detail: string }> {
-    const authType = row.sshAuthType as SshAuthType;
-    if (authType === "vault_ref") {
-      return { ok: false, detail: "доступ описан ссылкой в vault — платформа по нему не ходит; выберите пароль или ключ" };
-    }
-
-    let secret: Record<string, string>;
-    try {
-      secret = decryptCredentials(row.sshSecret, this.cfg.secretsMasterKey);
-    } catch (err) {
-      // Штатный сценарий: сменили SECRETS_MASTER_KEY или подняли дамп со старым ключом.
-      this.log.error(
-        `server ${row.hostname}: ssh-секрет не читается — ${err instanceof Error ? err.message : String(err)}. ` +
-          `Проверьте SECRETS_MASTER_KEY`,
-      );
-      return { ok: false, detail: "секрет не читается — проверьте SECRETS_MASTER_KEY" };
-    }
-
-    let creds: SshProbeCreds;
-    if (authType === "password") {
-      if (!secret.password) return { ok: false, detail: "пароль не задан" };
-      creds = { kind: "password", password: secret.password };
-    } else {
-      if (!secret.privateKey) return { ok: false, detail: "приватный ключ не задан" };
-      creds = { kind: "key", privateKey: secret.privateKey, passphrase: secret.passphrase || undefined };
-    }
-
-    return probeSsh({ host: row.primaryIp, port: row.sshPort ?? 22, user: row.sshUser || "root", creds });
+    const ssh = resolveServerSsh(row, this.cfg.secretsMasterKey);
+    if (!ssh.ok) return { ok: false, detail: ssh.detail };
+    return probeSsh({ host: ssh.host, port: ssh.port, user: ssh.user, creds: ssh.creds });
   }
 
   private async getServerRow(id: string): Promise<typeof schema.server.$inferSelect> {

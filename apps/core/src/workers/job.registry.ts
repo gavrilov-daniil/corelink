@@ -12,6 +12,7 @@ import { PaymentReconcileJob } from "./jobs/payment-reconcile.job.js";
 import { AbuseScanJob } from "./jobs/abuse-scan.job.js";
 import { AiSuggestJob } from "./jobs/ai-suggest.job.js";
 import { MaintenanceJob } from "./jobs/maintenance.job.js";
+import { ProvisionResumeJob } from "./jobs/provision-resume.job.js";
 
 export interface JobRunRecord {
   startedAt: Date;
@@ -45,6 +46,7 @@ export class JobRegistry {
     abuseScan: AbuseScanJob,
     aiSuggest: AiSuggestJob,
     maintenance: MaintenanceJob,
+    provisionResume: ProvisionResumeJob,
   ) {
     const runners: JobRunner[] = [
       subscriptionExpire,
@@ -58,6 +60,7 @@ export class JobRegistry {
       abuseScan,
       aiSuggest,
       maintenance,
+      provisionResume,
     ];
     for (const runner of runners) this.runners.set(runner.jobName, runner);
   }

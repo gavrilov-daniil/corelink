@@ -8,6 +8,7 @@ import { CascadeService } from "./cascade.service.js";
 import { StatsService } from "./stats.service.js";
 import { AbuseService } from "./abuse.service.js";
 import { NodeIdentityService } from "./node-identity.service.js";
+import { ProvisionService } from "./provision.service.js";
 import { DesiredStateSigner } from "./desired-state.signer.js";
 
 @Module({
@@ -18,9 +19,18 @@ import { DesiredStateSigner } from "./desired-state.signer.js";
     StatsService,
     AbuseService,
     NodeIdentityService,
+    ProvisionService,
     InfraService,
     DesiredStateSigner,
   ],
-  exports: [NodeStateService, CascadeService, StatsService, AbuseService, NodeIdentityService, InfraService],
+  exports: [
+    NodeStateService,
+    CascadeService,
+    StatsService,
+    AbuseService,
+    NodeIdentityService,
+    ProvisionService,
+    InfraService,
+  ],
 })
 export class NodesModule {}

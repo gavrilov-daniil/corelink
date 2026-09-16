@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import {
   FINGERPRINTS,
   INBOUND_FLOWS,
@@ -24,6 +24,8 @@ import {
   getSquads,
   issueEnrollment,
   provisionLocation,
+  provisionServer,
+  getProvisionRun,
   updateConfigProfile,
   updateHost,
   updateInbound,
@@ -34,6 +36,7 @@ import {
   type Inbound,
   type Node,
   type ProvisionResult,
+  type ProvisionRun,
   type RebuildInfo,
   type Server,
   type SshAuthType,
@@ -1273,6 +1276,87 @@ function commonSni(inbounds: Inbound[]): string {
 
 // --- мастер «Добавить локацию» ----------------------------------------------
 
+const PROVISION_STATUS: Record<ProvisionRun["status"], { label: string; cls: string }> = {
+  queued: { label: "в очереди", cls: "muted" },
+  running: { label: "настраивается…", cls: "" },
+  success: { label: "готово", cls: "ok" },
+  failed: { label: "ошибка", cls: "err" },
+};
+
+/**
+ * Авто-настройка сервера по SSH: запускает провижн и стримит лог прогона. Пока прогон
+ * идёт (queued/running) — опрос раз в 2 секунды; на success/failed опрос прекращается.
+ */
+function ProvisionPanel({ serverId }: { serverId: string }) {
+  const [runId, setRunId] = useState<string | null>(null);
+  const [run, setRun] = useState<ProvisionRun | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const start = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      setRunId((await provisionServer(serverId)).runId);
+    } catch (e) {
+      setError(errorMessage(e));
+      setBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!runId) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      try {
+        const r = await getProvisionRun(runId);
+        if (stopped) return;
+        setRun(r);
+        if (r.status === "queued" || r.status === "running") {
+          timer = setTimeout(() => void poll(), 2000);
+        } else {
+          setBusy(false);
+        }
+      } catch (e) {
+        if (stopped) return;
+        setError(errorMessage(e));
+        setBusy(false);
+      }
+    };
+    void poll();
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
+  }, [runId]);
+
+  if (!runId) {
+    return (
+      <div className="provision-panel">
+        <button type="button" className="btn btn-primary btn-sm" disabled={busy} onClick={() => void start()}>
+          {busy ? "Запуск…" : "Настроить сервер автоматически"}
+        </button>
+        {error && <span className="err small"> {error}</span>}
+        <p className="muted small">Платформа зайдёт по SSH, поставит Xray и агента и запустит его. Займёт пару минут.</p>
+      </div>
+    );
+  }
+
+  const status = run ? PROVISION_STATUS[run.status] : null;
+  return (
+    <div className="provision-panel">
+      <div className="provision-status">
+        Статус:{" "}
+        {status ? <span className={status.cls}>{status.label}</span> : <span className="muted">запускаем…</span>}
+      </div>
+      {run?.log && <pre className="code provision-log">{run.log}</pre>}
+      {run?.status === "failed" && run.error && <p className="err small">{run.error}</p>}
+      {error && <p className="err small">{error}</p>}
+    </div>
+  );
+}
+
 function LocationWizard({
   squads,
   inbounds,
@@ -1394,6 +1478,7 @@ function LocationWizard({
             )}
           </div>
         )}
+        {sshConfigured && <ProvisionPanel serverId={result.server.id} />}
         <p className="muted small">
           Reality-ключи проставятся автоматически после энроллмента агента — до этого вход помечен «ждёт агента».
         </p>

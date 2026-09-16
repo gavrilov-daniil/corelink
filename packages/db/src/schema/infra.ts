@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, integer, boolean, timestamp, jsonb, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, integer, boolean, timestamp, jsonb, uniqueIndex, index } from "drizzle-orm/pg-core";
 import { createdAt, orgId, updatedAt } from "./_shared.js";
 import { subscription } from "./subscribers.js";
 
@@ -196,3 +196,22 @@ export const nodeIdentity = pgTable("node_identity", {
   uniqueIndex("node_identity_bootstrap_uq").on(t.bootstrapTokenHash),
   uniqueIndex("node_identity_agent_token_uq").on(t.agentTokenHash),
 ]);
+
+// Прогон авто-настройки сервера по SSH (установка Xray + node-agent, запись конфига,
+// enable агента). Лог накопительный — секреты (bootstrap-токен, пароли) в нём
+// маскируются; статус ведёт worker-джоба provision-server. История — по строке на
+// попытку; параллельные прогоны на один сервер отсекает advisory-lock в джобе, а не
+// индекс: повтор — это переустановка поверх, а не конфликт.
+export const provisionRun = pgTable("provision_run", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  orgId: orgId(),
+  serverId: uuid("server_id").notNull().references(() => server.id),
+  nodeId: uuid("node_id").references(() => node.id),
+  kind: text("kind").notNull().default("provision"), // provision | reprovision
+  status: text("status").notNull().default("queued"), // queued | running | success | failed
+  log: text("log").notNull().default(""),
+  error: text("error"),
+  startedAt: timestamp("started_at", { withTimezone: true }),
+  finishedAt: timestamp("finished_at", { withTimezone: true }),
+  createdAt: createdAt(),
+}, (t) => [index("provision_run_server_idx").on(t.serverId, t.createdAt)]);

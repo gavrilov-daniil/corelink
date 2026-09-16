@@ -1,5 +1,6 @@
 import { Body, Controller, Delete, Get, Param, Patch, Post } from "@nestjs/common";
 import { InfraService } from "./infra.service.js";
+import { ProvisionService } from "./provision.service.js";
 import type { Raw } from "./infra.validation.js";
 
 /**
@@ -11,7 +12,10 @@ import type { Raw } from "./infra.validation.js";
  */
 @Controller("api/admin")
 export class InfraAdminController {
-  constructor(private readonly infra: InfraService) {}
+  constructor(
+    private readonly infra: InfraService,
+    private readonly provisionSvc: ProvisionService,
+  ) {}
 
   /**
    * Мастер «Добавить локацию»: одной транзакцией заводит сервер → профиль → ноду →
@@ -48,6 +52,28 @@ export class InfraAdminController {
   @Post("servers/:id/ssh-check")
   sshCheck(@Param("id") id: string) {
     return this.infra.sshCheck(id);
+  }
+
+  // --- авто-настройка сервера по SSH (установка Xray + node-agent) ---
+
+  @Post("servers/:id/provision")
+  provisionServer(@Param("id") id: string) {
+    return this.provisionSvc.start(id);
+  }
+
+  @Post("servers/:id/reprovision")
+  reprovisionServer(@Param("id") id: string) {
+    return this.provisionSvc.start(id, "reprovision");
+  }
+
+  @Get("servers/:id/provision-runs")
+  listProvisionRuns(@Param("id") id: string) {
+    return this.provisionSvc.listRuns(id);
+  }
+
+  @Get("provision-runs/:id")
+  getProvisionRun(@Param("id") id: string) {
+    return this.provisionSvc.getRun(id);
   }
 
   // --- config-профили ---
