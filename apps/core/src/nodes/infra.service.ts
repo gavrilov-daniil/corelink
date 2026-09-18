@@ -274,12 +274,89 @@ export class InfraService {
       throw new ConflictException(`на сервере стоят ноды: ${nodes.map((n) => n.name).join(", ")} — сначала удалите их`);
     }
 
-    const [row] = await this.db
-      .delete(schema.server)
-      .where(and(eq(schema.server.orgId, this.org), eq(schema.server.id, id)))
-      .returning({ id: schema.server.id });
+    const [row] = await this.db.transaction(async (tx) => {
+      // Прогоны провижина ссылаются на сервер — без чистки FK не даст удалить.
+      await tx.delete(schema.provisionRun).where(eq(schema.provisionRun.serverId, id));
+      return tx
+        .delete(schema.server)
+        .where(and(eq(schema.server.orgId, this.org), eq(schema.server.id, id)))
+        .returning({ id: schema.server.id });
+    });
     if (!row) throw new NotFoundException(`сервер ${id} не найден`);
     return { ok: true };
+  }
+
+  /**
+   * Каскадное удаление локации целиком: сервер + его нода(ы) со всей инфра-цепочкой
+   * (профиль, inbound'ы, host'ы, привязки к squad'ам, identity/desired/reported,
+   * прогоны провижина). Обратное provisionLocation — чтобы почистить заведённое, не
+   * разбирая цепочку вручную в advanced.
+   *
+   * Боевую локацию не сносит: если на ноду ссылаются каскады, каналы подписок, трафик
+   * или абьюз-сигналы — это работающая сеть, а не тестовый мусор. Отказ текстом, а не
+   * молчаливое удаление того, что раздаётся клиентам.
+   */
+  async deleteLocation(serverId: string) {
+    requireUuid(serverId);
+    await this.getServerRow(serverId); // 404, если сервера нет
+
+    const nodes = await this.db
+      .select({ id: schema.node.id, configProfileId: schema.node.configProfileId })
+      .from(schema.node)
+      .where(and(eq(schema.node.orgId, this.org), eq(schema.node.serverId, serverId)));
+
+    for (const n of nodes) {
+      const blockers = [
+        ...(await this.refCount(
+          sql`select count(*)::int as n from cascade_link
+            where exit_node_id = ${n.id} or relay_node_id = ${n.id} or front_node_id = ${n.id}`,
+          "каскад",
+        )),
+        ...(await this.refCount(sql`select count(*)::int as n from channel where front_node_id = ${n.id}`, "канал подписки (front)")),
+        ...(await this.refCount(
+          sql`select count(*)::int as n from channel c join host h on h.id = c.host_id where h.node_id = ${n.id}`,
+          "канал подписки",
+        )),
+        ...(await this.refCount(sql`select count(*)::int as n from traffic_sample where node_id = ${n.id}`, "запись трафика")),
+        ...(await this.refCount(sql`select count(*)::int as n from traffic_daily where node_id = ${n.id}`, "агрегат трафика")),
+        ...(await this.refCount(sql`select count(*)::int as n from traffic_report where node_id = ${n.id}`, "отчёт агента")),
+        ...(await this.refCount(sql`select count(*)::int as n from abuse_signal where node_id = ${n.id}`, "сигнал абьюза")),
+        ...(await this.refCount(sql`select count(*)::int as n from torrent_ban where node_id = ${n.id}`, "торрент-бан")),
+        ...(await this.refCount(sql`select count(*)::int as n from online_state where node_id = ${n.id}`, "online-состояние")),
+      ];
+      if (blockers.length > 0) {
+        throw new ConflictException(`локация в работе: ${blockers.join(", ")} — удалить нельзя`);
+      }
+    }
+
+    await this.db.transaction(async (tx) => {
+      for (const n of nodes) {
+        const inbs = await tx
+          .select({ id: schema.inbound.id })
+          .from(schema.inbound)
+          .where(eq(schema.inbound.configProfileId, n.configProfileId));
+        const inbIds = inbs.map((i) => i.id);
+        if (inbIds.length > 0) {
+          await tx.delete(schema.squadInbound).where(inArray(schema.squadInbound.inboundId, inbIds));
+        }
+        await tx.delete(schema.host).where(eq(schema.host.nodeId, n.id));
+        if (inbIds.length > 0) {
+          await tx.delete(schema.inbound).where(inArray(schema.inbound.id, inbIds));
+        }
+        await tx.delete(schema.provisionRun).where(eq(schema.provisionRun.nodeId, n.id));
+        await tx.delete(schema.nodeIdentity).where(eq(schema.nodeIdentity.nodeId, n.id));
+        await tx.delete(schema.nodeDesiredState).where(eq(schema.nodeDesiredState.nodeId, n.id));
+        await tx.delete(schema.nodeReportedState).where(eq(schema.nodeReportedState.nodeId, n.id));
+        await tx.delete(schema.node).where(and(eq(schema.node.orgId, this.org), eq(schema.node.id, n.id)));
+        await tx
+          .delete(schema.configProfile)
+          .where(and(eq(schema.configProfile.orgId, this.org), eq(schema.configProfile.id, n.configProfileId)));
+      }
+      await tx.delete(schema.provisionRun).where(eq(schema.provisionRun.serverId, serverId));
+      await tx.delete(schema.server).where(and(eq(schema.server.orgId, this.org), eq(schema.server.id, serverId)));
+    });
+
+    return { ok: true, removedNodes: nodes.length };
   }
 
   // --- config-профили --------------------------------------------------------
@@ -471,6 +548,7 @@ export class InfraService {
     }
 
     await this.db.transaction(async (tx) => {
+      await tx.delete(schema.provisionRun).where(eq(schema.provisionRun.nodeId, id));
       await tx.delete(schema.nodeIdentity).where(eq(schema.nodeIdentity.nodeId, id));
       await tx.delete(schema.nodeDesiredState).where(eq(schema.nodeDesiredState.nodeId, id));
       await tx.delete(schema.nodeReportedState).where(eq(schema.nodeReportedState.nodeId, id));

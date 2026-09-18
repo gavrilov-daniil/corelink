@@ -624,6 +624,10 @@ export interface ProvisionInput {
 export const provisionLocation = (body: ProvisionInput) =>
   request<ProvisionResult>("/api/admin/infra/provision", post(body));
 
+/** Каскадное удаление локации: сервер + нода(ы) со всей цепочкой. Отвергается, если локация в работе. */
+export const deleteLocation = (serverId: string) =>
+  request<{ ok: boolean; removedNodes: number }>(`/api/admin/infra/locations/${serverId}`, del());
+
 // --- авто-настройка сервера по SSH ------------------------------------------
 
 export interface ProvisionRun {

@@ -27,6 +27,12 @@ export class InfraAdminController {
     return this.infra.provisionLocation(body ?? {});
   }
 
+  /** Каскадное удаление локации: сервер + нода(ы) со всей цепочкой. Обратное provision. */
+  @Delete("infra/locations/:serverId")
+  deleteLocation(@Param("serverId") serverId: string) {
+    return this.infra.deleteLocation(serverId);
+  }
+
   // --- серверы ---
 
   @Get("servers")

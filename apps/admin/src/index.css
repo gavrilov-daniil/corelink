@@ -241,6 +241,29 @@ a {
   flex-wrap: wrap;
 }
 
+.orphan-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--cl-space-2);
+  padding: var(--cl-space-2) 0;
+}
+.orphan-row + .orphan-row {
+  border-top: 1px solid var(--cl-border-subtle);
+}
+
+.provision-panel {
+  margin-top: var(--cl-space-3);
+}
+.provision-status,
+.provision-ssh-check {
+  margin-top: var(--cl-space-2);
+}
+.provision-log {
+  max-height: 320px;
+  overflow: auto;
+}
+
 /* --- Кнопки и поля --- */
 
 .btn {

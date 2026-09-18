@@ -551,3 +551,34 @@ describe("SSH-доступ", () => {
     assert.match(result.detail, /не задан/);
   });
 });
+
+describe("удаление локации", () => {
+  it("сносит сервер, ноду, профиль, inbound и host целиком", async () => {
+    const res = await infra.provisionLocation({
+      name: `loc-${Math.random().toString(36).slice(2, 8)}`,
+      primaryIp: "203.0.113.20",
+      sni: "ads.x5.ru",
+    });
+
+    const del = await infra.deleteLocation(res.server.id);
+    assert.equal(del.ok, true);
+    assert.equal(del.removedNodes, 1);
+
+    assert.equal((await db.select().from(schema.server).where(eq(schema.server.id, res.server.id))).length, 0);
+    assert.equal((await db.select().from(schema.node).where(eq(schema.node.id, res.node.id))).length, 0);
+    assert.equal((await db.select().from(schema.inbound).where(eq(schema.inbound.id, res.inbound.id))).length, 0);
+    assert.equal((await db.select().from(schema.host).where(eq(schema.host.id, res.host.id))).length, 0);
+  });
+
+  it("не сносит локацию, на ноду которой уже пришёл трафик", async () => {
+    const res = await infra.provisionLocation({
+      name: `loc-${Math.random().toString(36).slice(2, 8)}`,
+      primaryIp: "203.0.113.21",
+      sni: "ads.x5.ru",
+    });
+    await db.insert(schema.trafficReport).values({ orgId: TEST_ORG_ID, nodeId: res.node.id, reportId: "1:1" });
+
+    await assert.rejects(() => infra.deleteLocation(res.server.id), (e) => status(e) === 409);
+    assert.equal((await db.select().from(schema.server).where(eq(schema.server.id, res.server.id))).length, 1);
+  });
+});

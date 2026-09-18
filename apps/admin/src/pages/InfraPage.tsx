@@ -14,6 +14,7 @@ import {
   deleteHost,
   deleteInbound,
   deleteServer,
+  deleteLocation,
   deleteSquad,
   errorMessage,
   getConfigProfiles,
@@ -327,9 +328,11 @@ export default function InfraPage() {
       {mode === "simple" && (
         <SimpleInfra
           nodes={nodes}
+          servers={servers}
           inbounds={inbounds}
           onAdd={() => setWizardOpen(true)}
           onEnroll={(n) => setEnrollTarget(n)}
+          onReload={() => page.reload()}
         />
       )}
 
@@ -1169,18 +1172,45 @@ function SquadModal({
  */
 function SimpleInfra({
   nodes,
+  servers,
   inbounds,
   onAdd,
   onEnroll,
+  onReload,
 }: {
   nodes: Node[];
+  servers: Server[];
   inbounds: Inbound[];
   onAdd: () => void;
   onEnroll: (n: { id: string; name: string }) => void;
+  onReload: () => void;
 }) {
   // первый inbound ноды: в простом режиме на ноду заводится ровно один
   const inboundByNode = new Map<string, Inbound>();
   for (const i of inbounds) if (i.nodeId && !inboundByNode.has(i.nodeId)) inboundByNode.set(i.nodeId, i);
+
+  // серверы без ноды: в основную таблицу локаций не попадают, но почистить их надо где-то
+  const orphanServers = servers.filter((s) => s.nodeCount === 0);
+
+  const removeLocation = async (n: Node) => {
+    if (!window.confirm(`Удалить локацию «${n.name}» вместе с сервером, нодой и входом? Действие необратимо.`)) return;
+    try {
+      await deleteLocation(n.serverId);
+      onReload();
+    } catch (e) {
+      window.alert(errorMessage(e));
+    }
+  };
+
+  const removeOrphan = async (s: Server) => {
+    if (!window.confirm(`Удалить сервер «${s.hostname}» без локации?`)) return;
+    try {
+      await deleteServer(s.id);
+      onReload();
+    } catch (e) {
+      window.alert(errorMessage(e));
+    }
+  };
 
   const columns: Column<Node>[] = [
     {
@@ -1214,9 +1244,14 @@ function SimpleInfra({
       title: "",
       align: "right",
       render: (n) => (
-        <button type="button" className="btn btn-sm" onClick={() => onEnroll({ id: n.id, name: n.name })}>
-          Токен агента
-        </button>
+        <div className="row-actions">
+          <button type="button" className="btn btn-sm" onClick={() => onEnroll({ id: n.id, name: n.name })}>
+            Токен агента
+          </button>
+          <button type="button" className="btn btn-sm btn-danger" onClick={() => void removeLocation(n)}>
+            Удалить
+          </button>
+        </div>
       ),
     },
   ];
@@ -1246,6 +1281,26 @@ function SimpleInfra({
           <Table columns={columns} rows={nodes} rowKey={(n) => n.id} />
         )}
       </Card>
+
+      {orphanServers.length > 0 && (
+        <Card title="Серверы без локации" subtitle="Заведены, но ноды на них нет — обычно остатки тестов.">
+          {orphanServers.map((s) => (
+            <div key={s.id} className="orphan-row">
+              <span className="mono">
+                {s.hostname}
+                <span className="muted">
+                  {" · "}
+                  {s.primaryIp}
+                  {s.country ? ` · ${s.country}` : ""}
+                </span>
+              </span>
+              <button type="button" className="btn btn-sm btn-danger" onClick={() => void removeOrphan(s)}>
+                Удалить
+              </button>
+            </div>
+          ))}
+        </Card>
+      )}
     </>
   );
 }
