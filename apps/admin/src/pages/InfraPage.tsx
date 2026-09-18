@@ -1212,6 +1212,8 @@ function SimpleInfra({
     }
   };
 
+  const [provisionTarget, setProvisionTarget] = useState<{ serverId: string; name: string } | null>(null);
+
   const columns: Column<Node>[] = [
     {
       key: "name",
@@ -1245,6 +1247,13 @@ function SimpleInfra({
       align: "right",
       render: (n) => (
         <div className="row-actions">
+          <button
+            type="button"
+            className="btn btn-sm btn-primary"
+            onClick={() => setProvisionTarget({ serverId: n.serverId, name: n.name })}
+          >
+            Настроить
+          </button>
           <button type="button" className="btn btn-sm" onClick={() => onEnroll({ id: n.id, name: n.name })}>
             Токен агента
           </button>
@@ -1300,6 +1309,18 @@ function SimpleInfra({
             </div>
           ))}
         </Card>
+      )}
+
+      {provisionTarget && (
+        <Modal
+          title={`Настройка: ${provisionTarget.name}`}
+          onClose={() => {
+            setProvisionTarget(null);
+            onReload();
+          }}
+        >
+          <ProvisionPanel serverId={provisionTarget.serverId} />
+        </Modal>
       )}
     </>
   );
