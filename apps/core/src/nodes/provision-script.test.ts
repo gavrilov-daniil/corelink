@@ -59,6 +59,7 @@ describe("buildProvisionScript", () => {
   it("включает set -euo pipefail и запуск агента", () => {
     const s = buildProvisionScript(base);
     assert.match(s, /set -euo pipefail/);
-    assert.match(s, /systemctl enable --now node-agent\.service/);
+    assert.match(s, /systemctl restart node-agent\.service/);
+    assert.match(s, /journalctl -u node-agent\.service/);
   });
 });

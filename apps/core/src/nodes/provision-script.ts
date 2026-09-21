@@ -195,10 +195,30 @@ ${NODE_AGENT_UNIT}AGENTUNIT
 
 echo "=== 7/7 запуск ==="
 systemctl daemon-reload
-systemctl enable --now xray.service || true
-systemctl enable --now node-agent.service
-sleep 2
-systemctl is-active node-agent.service
-echo "=== готово: node-agent запущен, ждёт desired-state ==="
+# Xray: installer поднял его со своим путём (/usr/local/etc); рестарт применяет наш
+# drop-in на /etc/xray/config.json. || true — конфиг пока минимальный, это норма.
+systemctl enable xray.service >/dev/null 2>&1 || true
+systemctl restart xray.service || true
+systemctl enable node-agent.service >/dev/null 2>&1 || true
+systemctl restart node-agent.service || true
+# Ждём выхода агента в active. Type=simple + Restart: "activating"/крэш-цикл — это НЕ
+# успех, поэтому ждём до 20 с и при неудаче собираем журнал в лог прогона (иначе
+# причина падения не видна в админке).
+active=""
+for _ in $(seq 1 20); do
+  active=$(systemctl is-active node-agent.service 2>/dev/null || true)
+  [ "$active" = "active" ] && break
+  sleep 1
+done
+echo "node-agent: $active"
+if [ "$active" != "active" ]; then
+  echo "--- systemctl status node-agent ---"
+  systemctl status node-agent.service --no-pager -l 2>&1 | tail -n 25 || true
+  echo "--- journalctl node-agent ---"
+  journalctl -u node-agent.service --no-pager -n 80 2>&1 || true
+  echo "ОШИБКА: node-agent не вышел в active за 20 с (см. журнал выше)"
+  exit 1
+fi
+echo "=== готово: node-agent активен, ждёт desired-state ==="
 `;
 }
