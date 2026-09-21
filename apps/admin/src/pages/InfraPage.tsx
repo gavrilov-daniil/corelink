@@ -23,7 +23,6 @@ import {
   getNodes,
   getServers,
   getSquads,
-  issueEnrollment,
   provisionLocation,
   provisionServer,
   getProvisionRun,
@@ -44,15 +43,12 @@ import {
   type Squad,
 } from "../api";
 import { useResource } from "../useResource";
-import { formatDateTime } from "../format";
 import Card from "../components/Card";
 import Table, { type Column } from "../components/Table";
 import Modal from "../components/Modal";
 import Field from "../components/Field";
 import Toggle from "../components/Toggle";
 import StatusBadge from "../components/StatusBadge";
-import CopyButton from "../components/CopyButton";
-import AgentInstall from "../components/AgentInstall";
 import EmptyState from "../components/EmptyState";
 import ErrorBox from "../components/ErrorBox";
 import Loading from "../components/Loading";
@@ -101,7 +97,6 @@ export default function InfraPage() {
   const [notice, setNotice] = useState<string | null>(null);
   const [mode, setMode] = useState<Mode>(loadMode);
   const [wizardOpen, setWizardOpen] = useState(false);
-  const [enrollTarget, setEnrollTarget] = useState<{ id: string; name: string } | null>(null);
   const [sshChecks, setSshChecks] = useState<Record<string, CheckState>>({});
 
   const switchMode = (next: Mode) => {
@@ -331,7 +326,6 @@ export default function InfraPage() {
           servers={servers}
           inbounds={inbounds}
           onAdd={() => setWizardOpen(true)}
-          onEnroll={(n) => setEnrollTarget(n)}
           onReload={() => page.reload()}
         />
       )}
@@ -439,11 +433,7 @@ export default function InfraPage() {
             setNotice(msg);
             page.reload();
           }}
-          onEnroll={(n) => setEnrollTarget(n)}
         />
-      )}
-      {enrollTarget && (
-        <AgentEnrollModal node={enrollTarget} onClose={() => setEnrollTarget(null)} />
       )}
 
       {serverForm && (
@@ -1175,14 +1165,12 @@ function SimpleInfra({
   servers,
   inbounds,
   onAdd,
-  onEnroll,
   onReload,
 }: {
   nodes: Node[];
   servers: Server[];
   inbounds: Inbound[];
   onAdd: () => void;
-  onEnroll: (n: { id: string; name: string }) => void;
   onReload: () => void;
 }) {
   // первый inbound ноды: в простом режиме на ноду заводится ровно один
@@ -1254,9 +1242,6 @@ function SimpleInfra({
           >
             Настроить
           </button>
-          <button type="button" className="btn btn-sm" onClick={() => onEnroll({ id: n.id, name: n.name })}>
-            Токен агента
-          </button>
           <button type="button" className="btn btn-sm btn-danger" onClick={() => void removeLocation(n)}>
             Удалить
           </button>
@@ -1319,7 +1304,7 @@ function SimpleInfra({
             onReload();
           }}
         >
-          <ProvisionPanel serverId={provisionTarget.serverId} />
+          <ProvisionPanel serverId={provisionTarget.serverId} autoStart />
         </Modal>
       )}
     </>
@@ -1363,10 +1348,10 @@ const PROVISION_STATUS: Record<ProvisionRun["status"], { label: string; cls: str
  * Авто-настройка сервера по SSH: запускает провижн и стримит лог прогона. Пока прогон
  * идёт (queued/running) — опрос раз в 2 секунды; на success/failed опрос прекращается.
  */
-function ProvisionPanel({ serverId }: { serverId: string }) {
+function ProvisionPanel({ serverId, autoStart }: { serverId: string; autoStart?: boolean }) {
   const [runId, setRunId] = useState<string | null>(null);
   const [run, setRun] = useState<ProvisionRun | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState(Boolean(autoStart));
   const [error, setError] = useState<string | null>(null);
 
   const start = async () => {
@@ -1379,6 +1364,12 @@ function ProvisionPanel({ serverId }: { serverId: string }) {
       setBusy(false);
     }
   };
+
+  // Авто-настройка стартует сама: человек не копирует токены и команды, только смотрит лог.
+  useEffect(() => {
+    if (autoStart) void start();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (!runId) return;
@@ -1438,13 +1429,11 @@ function LocationWizard({
   inbounds,
   onClose,
   onProvisioned,
-  onEnroll,
 }: {
   squads: Squad[];
   inbounds: Inbound[];
   onClose: () => void;
   onProvisioned: (msg: string) => void;
-  onEnroll: (n: { id: string; name: string }) => void;
 }) {
   const [name, setName] = useState("");
   const [primaryIp, setPrimaryIp] = useState("");
@@ -1512,21 +1501,9 @@ function LocationWizard({
         title="Локация заведена"
         onClose={onClose}
         footer={
-          <>
-            <button
-              type="button"
-              className="btn btn-primary"
-              onClick={() => {
-                onEnroll({ id: result.node.id, name: result.node.label });
-                onClose();
-              }}
-            >
-              Выпустить токен агента
-            </button>
-            <button type="button" className="btn" onClick={onClose}>
-              Закрыть
-            </button>
-          </>
+          <button type="button" className="btn" onClick={onClose}>
+            Закрыть
+          </button>
         }
       >
         <ul className="provision-summary">
@@ -1554,7 +1531,7 @@ function LocationWizard({
             )}
           </div>
         )}
-        {sshConfigured && <ProvisionPanel serverId={result.server.id} />}
+        {sshConfigured && <ProvisionPanel serverId={result.server.id} autoStart />}
         <p className="muted small">
           Reality-ключи проставятся автоматически после энроллмента агента — до этого вход помечен «ждёт агента».
         </p>
@@ -1684,74 +1661,4 @@ function describeProvision(res: ProvisionResult): string {
   return `Локация «${res.node.label}»: заведено — ${created.join(", ")}. Дальше выпустите токен агента.`;
 }
 
-// --- энроллмент из простого режима ------------------------------------------
-
-/**
- * Bootstrap-токен показывается один раз (в БД лежит только хеш), поэтому окно не
- * закрывается автоматически. Та же ручка, что и на странице «Ноды и каскады».
- */
-function AgentEnrollModal({ node, onClose }: { node: { id: string; name: string }; onClose: () => void }) {
-  const [token, setToken] = useState<string | null>(null);
-  const [expiresAt, setExpiresAt] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const issue = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      const res = await issueEnrollment(node.id);
-      setToken(res.bootstrapToken);
-      setExpiresAt(res.bootstrapExpiresAt);
-    } catch (e) {
-      setError(errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <Modal
-      title={`Токен агента · ${node.name}`}
-      onClose={onClose}
-      footer={
-        <>
-          {error && <span className="err">{error}</span>}
-          <button type="button" className="btn" onClick={onClose}>
-            Закрыть
-          </button>
-          <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void issue()}>
-            {busy ? "Выпускаем…" : token ? "Выпустить заново" : "Выпустить токен"}
-          </button>
-        </>
-      }
-    >
-      <div className="kv">
-        <div>
-          <span className="kv-key">NODE_ID</span>
-          <span className="kv-val mono">{node.id}</span>
-        </div>
-      </div>
-      {token ? (
-        <>
-          <h3 className="form-section">Bootstrap-токен</h3>
-          <pre className="code">{token}</pre>
-          <div className="row-actions">
-            <CopyButton value={token} title="Скопировать токен" />
-          </div>
-          <p className="warn small">
-            Значение видно один раз: в базе лежит только его хеш. Годен до {formatDateTime(expiresAt)}.
-          </p>
-
-          <AgentInstall nodeId={node.id} token={token} />
-        </>
-      ) : (
-        <p className="muted small">
-          Выпуск даёт одноразовый токен: агент на сервере обменяет его на постоянный и заберёт конфиг. Прежний
-          невыпущенный токен этой ноды перестанет действовать.
-        </p>
-      )}
-    </Modal>
-  );
-}
 
