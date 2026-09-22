@@ -155,6 +155,12 @@ fi
 install -d -m 0755 /etc/systemd/system/xray.service.d
 cat > /etc/systemd/system/xray.service.d/10-corelink-config.conf <<'XRAYDROP'
 [Service]
+# Xray и агент — под одним пользователем node-agent: агент пишет /etc/xray/config.json
+# (там Reality-приватник, права 600), Xray его читает. Иначе два владельца дерутся за
+# файл. Ambient-права для bind на 443 сохраняем.
+User=node-agent
+Group=node-agent
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 ExecStart=
 ExecStart=/usr/local/bin/xray run -config /etc/xray/config.json
 XRAYDROP
@@ -189,7 +195,12 @@ install -d -m 0755 /etc/node-agent
 cat > /etc/node-agent/config.json <<'AGENTCFG'
 ${configJson}
 AGENTCFG
+# Владелец — node-agent, иначе агент (не root) не прочитает свой конфиг: open ... permission denied.
+chown node-agent:node-agent /etc/node-agent/config.json
 chmod 600 /etc/node-agent/config.json
+# Xray работает под тем же node-agent (drop-in выше) — отдаём ему конфиг Xray и логи.
+chown -R node-agent:node-agent /etc/xray /var/log/xray 2>/dev/null || true
+chmod 600 /etc/xray/config.json
 cat > /etc/systemd/system/node-agent.service <<'AGENTUNIT'
 ${NODE_AGENT_UNIT}AGENTUNIT
 

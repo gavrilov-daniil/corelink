@@ -44,6 +44,12 @@ describe("buildProvisionScript", () => {
     assert.match(s, /subject\.user == "node-agent"/);
   });
 
+  it("отдаёт конфиг агента и Xray пользователю node-agent (иначе агент не прочитает свой конфиг)", () => {
+    const s = buildProvisionScript(base);
+    assert.match(s, /chown node-agent:node-agent \/etc\/node-agent\/config\.json/);
+    assert.match(s, /User=node-agent/);
+  });
+
   it("прибивает версию Xray, когда она задана", () => {
     const s = buildProvisionScript({ ...base, xrayVersion: "1.8.24" });
     assert.match(s, /install --version 1\.8\.24/);
