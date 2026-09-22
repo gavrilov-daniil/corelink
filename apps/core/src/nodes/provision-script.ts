@@ -211,11 +211,14 @@ for _ in $(seq 1 20); do
   sleep 1
 done
 echo "node-agent: $active"
+# Даём агенту сделать первый dial-out (enroll + pull) и собираем его журнал ВСЕГДА:
+# «active» ещё не значит «дозвонился до платформы» — немой успех это скрывал.
+sleep 8
+echo "--- journalctl node-agent ---"
+journalctl -u node-agent.service --no-pager -n 60 2>&1 || true
 if [ "$active" != "active" ]; then
   echo "--- systemctl status node-agent ---"
-  systemctl status node-agent.service --no-pager -l 2>&1 | tail -n 25 || true
-  echo "--- journalctl node-agent ---"
-  journalctl -u node-agent.service --no-pager -n 80 2>&1 || true
+  systemctl status node-agent.service --no-pager -l 2>&1 | tail -n 20 || true
   echo "ОШИБКА: node-agent не вышел в active за 20 с (см. журнал выше)"
   exit 1
 fi
