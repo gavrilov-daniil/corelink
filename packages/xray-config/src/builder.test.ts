@@ -32,6 +32,40 @@ test("assembleBase проходит инвариант-валидатор", () =
   assert.ok(res.ok);
 });
 
+test("CDN-канал: клиентский outbound tls + grpc + serviceName, без reality-настроек", () => {
+  const input: GeneratorInput = {
+    vlessUuid: "11111111-1111-1111-1111-111111111111",
+    domainList: { zones: [], domains: [] },
+    channels: [
+      {
+        kind: "direct",
+        tag: "cdn-de",
+        cc: "DE",
+        host: {
+          address: "cdn.example.com",
+          port: 443,
+          sni: "cdn.example.com",
+          fingerprint: "firefox",
+          pbk: "",
+          sid: "",
+          flow: "",
+          network: "grpc",
+          security: "tls",
+          serviceName: "grpcsvc",
+        },
+      },
+    ],
+  };
+  const profile: ProfileInput = { remark: "CDN", primary: ["cdn-de"], fallback: [] };
+  const cfg = buildProfileConfig(input, profile) as any;
+  const out = cfg.outbounds.find((o: any) => o.tag === "cdn-de");
+  assert.equal(out.streamSettings.security, "tls");
+  assert.equal(out.streamSettings.network, "grpc");
+  assert.equal(out.streamSettings.grpcSettings.serviceName, "grpcsvc");
+  assert.ok(out.streamSettings.tlsSettings, "tlsSettings должны быть");
+  assert.ok(!out.streamSettings.realitySettings, "для tls reality-настроек быть не должно");
+});
+
 test("двухтирный профиль: loopback-цепочка целостна, последний tier без fallbackTag", () => {
   const input = fixture();
   const profile: ProfileInput = { remark: "🇵🇱 Польша", primary: ["pl-direct"], fallback: ["pl-cascade"] };

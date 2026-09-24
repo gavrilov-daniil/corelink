@@ -41,6 +41,21 @@ test("приватный ключ Reality НЕ попадает в конфиг 
   assert.ok(!JSON.stringify(cfg).includes("PRIVKEY"));
 });
 
+test("CDN-нода: security=none + grpc + serviceName, без reality-настроек (TLS терминирует CDN)", () => {
+  const cfg = buildNodeConfig({
+    role: "exit",
+    inbounds: [
+      { tag: "CDN_DE", port: 443, role: "exit", reality, network: "grpc", security: "none", serviceName: "grpcsvc", flow: "" },
+    ],
+    users: [],
+  }) as any;
+  const inbound = cfg.inbounds.find((i: any) => i.tag === "CDN_DE");
+  assert.equal(inbound.streamSettings.network, "grpc");
+  assert.equal(inbound.streamSettings.security, "none");
+  assert.equal(inbound.streamSettings.grpcSettings.serviceName, "grpcsvc");
+  assert.ok(!inbound.streamSettings.realitySettings, "для security=none reality-настроек быть не должно");
+});
+
 test("анти-абьюз в конфиге ноды: bittorrent и SMTP в block", () => {
   const cfg = buildNodeConfig(exitNode()) as any;
   const rules = cfg.routing.rules;

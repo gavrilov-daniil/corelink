@@ -18,6 +18,11 @@ export interface NodeInbound {
   reality: RealityIdentity;
   flow?: string; // vision на tcp; пусто на grpc/xhttp
   network?: string;
+  /** reality (self-handshake, серт не нужен) | tls (серт на ноде, вариант B) | none (TLS терминирует CDN, вариант A). */
+  security?: string;
+  serviceName?: string; // grpc
+  path?: string; // ws/xhttp
+  host?: string; // ws/xhttp — Host-заголовок / :authority
 }
 
 /** Пользователь inbound'а. Для каскада это служебный link-user, представляющий relay на exit'е. */
@@ -73,11 +78,70 @@ const PRIVATE_DESTINATIONS = [
   "fe80::/10",
 ];
 
-function realityInbound(inbound: NodeInbound, users: NodeUser[]): Record<string, unknown> {
+/**
+ * Транспорт-специфичный блок streamSettings по network. tcp — пусто (нет settings).
+ * Для grpc/ws/xhttp Xray требует свой блок, иначе транспорт молча не поднимается.
+ */
+function transportSettings(inbound: NodeInbound): Record<string, unknown> | null {
+  switch (inbound.network) {
+    case "grpc":
+      return { grpcSettings: { serviceName: inbound.serviceName ?? "" } };
+    case "ws":
+      return { wsSettings: { path: inbound.path ?? "/", ...(inbound.host ? { headers: { Host: inbound.host } } : {}) } };
+    case "xhttp":
+      return { xhttpSettings: { path: inbound.path ?? "/", ...(inbound.host ? { host: inbound.host } : {}) } };
+    default:
+      return null; // tcp
+  }
+}
+
+/**
+ * Слой безопасности inbound'а. reality — self-handshake (серт не нужен, приватник на ноде).
+ * tls — реальный серт на ноде (вариант B, подставляет агент). none — TLS терминирует CDN
+ * перед нодой (вариант A), на ноде транспорт без шифрования.
+ *
+ * ВАЖНО: для reality вывод сохранён байт-в-байт (тот же порядок/поля), иначе сменится
+ * config_hash и все ноды перезальются, а golden-diff разъедется.
+ */
+function securitySettings(inbound: NodeInbound): Record<string, unknown> {
+  const security = inbound.security ?? "reality";
+  if (security === "reality") {
+    return {
+      security: "reality",
+      realitySettings: {
+        show: false,
+        dest: `${inbound.reality.sni}:443`,
+        serverNames: [inbound.reality.sni],
+        privateKey: "__REALITY_PRIVATE_KEY__", // подставляется агентом на ноде из локального ключа
+        shortIds: [...inbound.reality.shortIds].sort(),
+      },
+    };
+  }
+  if (security === "tls") {
+    return {
+      security: "tls",
+      tlsSettings: {
+        serverName: inbound.reality.sni,
+        alpn: inbound.network === "grpc" ? ["h2"] : ["h2", "http/1.1"],
+        // подставляет агент из локальных файлов (вариант B); плейсхолдеры по образцу reality
+        certificates: [{ certificateFile: "__TLS_CERT__", keyFile: "__TLS_KEY__" }],
+      },
+    };
+  }
+  return { security: "none" };
+}
+
+function buildInbound(inbound: NodeInbound, users: NodeUser[]): Record<string, unknown> {
   const clients = users
     .filter((u) => u.inboundTag === inbound.tag)
     .map((u) => ({ id: u.uuid, email: u.email, level: u.level ?? 0, flow: inbound.flow ?? "" }))
     .sort((a, b) => a.email.localeCompare(b.email)); // стабильный порядок → стабильный hash
+
+  const streamSettings: Record<string, unknown> = {
+    network: inbound.network ?? "tcp",
+    ...securitySettings(inbound),
+    ...(transportSettings(inbound) ?? {}),
+  };
 
   return {
     tag: inbound.tag,
@@ -89,17 +153,7 @@ function realityInbound(inbound: NodeInbound, users: NodeUser[]): Record<string,
       clients,
       decryption: "none",
     },
-    streamSettings: {
-      network: inbound.network ?? "tcp",
-      security: "reality",
-      realitySettings: {
-        show: false,
-        dest: `${inbound.reality.sni}:443`,
-        serverNames: [inbound.reality.sni],
-        privateKey: "__REALITY_PRIVATE_KEY__", // подставляется агентом на ноде из локального ключа
-        shortIds: [...inbound.reality.shortIds].sort(),
-      },
-    },
+    streamSettings,
     sniffing: {
       enabled: true,
       destOverride: ["http", "tls", "quic"],
@@ -142,7 +196,7 @@ function cascadeOutbound(c: CascadeOutbound): Record<string, unknown> {
 export function buildNodeConfig(input: NodeConfigInput): XrayConfig {
   const inbounds: Array<Record<string, unknown>> = [...input.inbounds]
     .sort((a, b) => a.tag.localeCompare(b.tag))
-    .map((i) => realityInbound(i, input.users));
+    .map((i) => buildInbound(i, input.users));
 
   // локальный gRPC API — через него агент снимает статистику
   inbounds.push({

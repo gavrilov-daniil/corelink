@@ -611,6 +611,16 @@ export interface ProvisionInput {
   fingerprint?: string;
   /** В какие squad'ы добавить inbound (доступ подписок). */
   squadIds?: string[];
+  /** Формат подключения. reality (default) | tls | none (CDN терминирует TLS). */
+  security?: string;
+  /** tcp (default) | grpc | ws | xhttp. */
+  network?: string;
+  /** Пусто для reality; для CDN — "" (vision только на tcp). */
+  flow?: string;
+  /** Транспорт CDN: { serviceName } для grpc, { path, host } для ws/xhttp. */
+  params?: Record<string, unknown>;
+  /** Адрес, куда стучится клиент (для CDN — CDN-домен; по умолчанию = primaryIp). */
+  hostAddress?: string;
   /** SSH-доступ к серверу для последующей авто-настройки; секреты шифруются в БД, наружу не отдаются. */
   sshAuthType?: SshAuthType;
   sshUser?: string | null;

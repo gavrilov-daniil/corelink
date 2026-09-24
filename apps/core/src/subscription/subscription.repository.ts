@@ -151,10 +151,12 @@ export class SubscriptionRepository {
    */
   private async loadChannels(orgId: string): Promise<ChannelInput[]> {
     const rows = await this.db
-      .select({ ch: schema.channel, host: schema.host, link: schema.cascadeLink })
+      .select({ ch: schema.channel, host: schema.host, link: schema.cascadeLink, inbound: schema.inbound })
       .from(schema.channel)
       .leftJoin(schema.host, eq(schema.channel.hostId, schema.host.id))
       .leftJoin(schema.cascadeLink, eq(schema.channel.cascadeLinkId, schema.cascadeLink.id))
+      // inbound несёт network/security/транспорт (CDN); без него клиент всегда получал бы tcp+reality
+      .leftJoin(schema.inbound, eq(schema.host.inboundId, schema.inbound.id))
       .where(
         and(
           eq(schema.channel.orgId, orgId),
@@ -167,11 +169,11 @@ export class SubscriptionRepository {
       .filter((r) => r.host)
       // канал без привязки к каскаду — обычный direct, его не отсекаем
       .filter((r) => !r.ch.cascadeLinkId || r.link?.status === "active")
-      .map(({ ch, host }) => ({
+      .map(({ ch, host, inbound }) => ({
         kind: ch.kind as "direct" | "cascade",
         tag: ch.newTag ?? ch.tag,
         cc: ch.cc ?? undefined,
-        host: hostRef(host!),
+        host: hostRef(host!, inbound),
       }));
   }
 
@@ -273,7 +275,8 @@ function bySort(a: { pc: { sortOrder: number } }, b: { pc: { sortOrder: number }
   return a.pc.sortOrder - b.pc.sortOrder;
 }
 
-function hostRef(h: typeof schema.host.$inferSelect) {
+function hostRef(h: typeof schema.host.$inferSelect, inb?: typeof schema.inbound.$inferSelect | null) {
+  const params = (inb?.params ?? {}) as { serviceName?: string; path?: string; host?: string };
   return {
     address: h.address,
     port: h.port,
@@ -282,6 +285,12 @@ function hostRef(h: typeof schema.host.$inferSelect) {
     pbk: h.pbk ?? "",
     sid: h.sid ?? "",
     flow: h.flow ?? "xtls-rprx-vision",
-    network: "tcp",
+    network: inb?.network ?? "tcp",
+    // нода за CDN стоит с security=none (CDN терминирует TLS), но клиент обязан шифровать
+    // TLS до CDN-домена, иначе CDN его не примет: none на ноде → tls у клиента.
+    security: (inb?.security ?? "reality") === "none" ? "tls" : (inb?.security ?? "reality"),
+    ...(params.serviceName ? { serviceName: params.serviceName } : {}),
+    ...(params.path ? { path: params.path } : {}),
+    ...(params.host ? { host: params.host } : {}),
   };
 }

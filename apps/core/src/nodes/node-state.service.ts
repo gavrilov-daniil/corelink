@@ -35,19 +35,26 @@ export class NodeStateService {
       .from(schema.inbound)
       .where(eq(schema.inbound.configProfileId, node.configProfileId));
 
-    const inbounds: NodeInbound[] = inboundRows.map((i) => ({
-      tag: i.tag,
-      port: i.port,
-      role: (node.roles[0] ?? "exit") as NodeInbound["role"],
-      flow: i.flow,
-      network: i.network,
-      reality: {
-        publicKey: i.realityPublicKey ?? "",
-        shortIds: i.shortIds.length > 0 ? i.shortIds : [""],
-        sni: i.sni ?? "",
-        fingerprint: i.fingerprint ?? "firefox",
-      },
-    }));
+    const inbounds: NodeInbound[] = inboundRows.map((i) => {
+      const params = (i.params ?? {}) as { serviceName?: string; path?: string; host?: string };
+      return {
+        tag: i.tag,
+        port: i.port,
+        role: (node.roles[0] ?? "exit") as NodeInbound["role"],
+        flow: i.flow,
+        network: i.network,
+        security: i.security,
+        ...(params.serviceName ? { serviceName: params.serviceName } : {}),
+        ...(params.path ? { path: params.path } : {}),
+        ...(params.host ? { host: params.host } : {}),
+        reality: {
+          publicKey: i.realityPublicKey ?? "",
+          shortIds: i.shortIds.length > 0 ? i.shortIds : [""],
+          sni: i.sni ?? "",
+          fingerprint: i.fingerprint ?? "firefox",
+        },
+      };
+    });
 
     const users = await this.collectUsers(node, inboundRows);
     const cascades = await this.collectCascades(nodeId, inboundRows);

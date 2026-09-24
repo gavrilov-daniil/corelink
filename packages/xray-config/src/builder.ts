@@ -24,17 +24,46 @@ function userInbounds(): Array<Record<string, unknown>> {
   ];
 }
 
-function realityStream(host: HostRef, dialerProxyTag?: string): Record<string, unknown> {
-  const stream: Record<string, unknown> = {
-    network: host.network ?? "tcp",
-    security: "reality",
-    realitySettings: {
+/** Транспорт-блок клиентского stream по network. tcp — пусто. */
+function transportStream(host: HostRef): Record<string, unknown> | null {
+  switch (host.network) {
+    case "grpc":
+      return { grpcSettings: { serviceName: host.serviceName ?? "" } };
+    case "ws":
+      return { wsSettings: { path: host.path ?? "/", ...(host.host ? { headers: { Host: host.host } } : {}) } };
+    case "xhttp":
+      return { xhttpSettings: { path: host.path ?? "/", ...(host.host ? { host: host.host } : {}) } };
+    default:
+      return null; // tcp
+  }
+}
+
+/**
+ * streamSettings клиентского outbound. reality — как раньше (байт-в-байт, иначе разъедется
+ * golden-diff). tls — CDN-fronting: клиент шифрует TLS до host.address (CDN-домена) поверх
+ * транспорта (grpc/ws/xhttp).
+ */
+function clientStream(host: HostRef, dialerProxyTag?: string): Record<string, unknown> {
+  const security = host.security ?? "reality";
+  const stream: Record<string, unknown> = { network: host.network ?? "tcp" };
+  if (security === "reality") {
+    stream.security = "reality";
+    stream.realitySettings = {
       serverName: host.sni,
       fingerprint: host.fingerprint,
       publicKey: host.pbk,
       shortId: host.sid,
-    },
-  };
+    };
+  } else {
+    stream.security = "tls";
+    stream.tlsSettings = {
+      serverName: host.sni,
+      fingerprint: host.fingerprint,
+      ...(host.alpn ? { alpn: host.alpn } : {}),
+    };
+  }
+  const transport = transportStream(host);
+  if (transport) Object.assign(stream, transport);
   if (dialerProxyTag) stream.sockopt = { dialerProxy: dialerProxyTag };
   return stream;
 }
@@ -52,7 +81,7 @@ function vlessOutbound(tag: string, uuid: string, host: HostRef, dialerProxyTag?
         },
       ],
     },
-    streamSettings: realityStream(host, dialerProxyTag),
+    streamSettings: clientStream(host, dialerProxyTag),
   };
 }
 

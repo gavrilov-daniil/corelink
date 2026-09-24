@@ -1109,14 +1109,17 @@ export class InfraService {
       ? tagStr(body, "tag", { required: true })!
       : tagStr({ tag: defaultInboundTag(name) }, "tag", { required: true })!;
     const network = enumOf(body, "network", INBOUND_NETWORKS) ?? "tcp";
+    const security = enumOf(body, "security", INBOUND_SECURITY) ?? "reality";
     const flow = enumOf(body, "flow", INBOUND_FLOWS, { allowEmpty: true }) ?? "xtls-rprx-vision";
     const sni = str(body, "sni", { required: true, max: 253 })!;
     const fingerprint = enumOf(body, "fingerprint", FINGERPRINTS) ?? "firefox";
     const port = portNum(body, "port") ?? 443;
     const shortIds = shortIdArray(body, "shortIds") ?? [];
-    const inbound = { tag, protocol: "vless", network, security: "reality", port, flow, sni, fingerprint, shortIds };
-    // security=reality без sni и vision не на tcp ловим здесь, а не сборкой конфига ноды
-    assertInboundShape({ security: "reality", sni, network, flow });
+    // CDN-транспорт (serviceName для grpc, path/host для ws/xhttp) живёт в params — генератор читает его.
+    const params = obj(body, "params") ?? {};
+    const inbound = { tag, protocol: "vless", network, security, port, flow, sni, fingerprint, shortIds, params };
+    // мусор ловим здесь, а не сборкой конфига ноды: sni при reality/tls, vision только на tcp
+    assertInboundShape({ security, sni, network, flow });
 
     const host = {
       remark: str(body, "hostRemark", { max: 128 }) ?? name,

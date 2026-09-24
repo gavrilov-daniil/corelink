@@ -27,7 +27,9 @@ export type SshAuthType = (typeof SSH_AUTH_TYPES)[number];
  * значение в БД врало бы про то, что реально работает.
  */
 export const INBOUND_PROTOCOLS = ["vless"] as const;
-export const INBOUND_SECURITY = ["reality"] as const;
+// reality — self-handshake (серт не нужен). tls — реальный серт (вариант B). none —
+// TLS терминирует CDN перед нодой (вариант A CDN-fronting), на ноде транспорт без шифрования.
+export const INBOUND_SECURITY = ["reality", "tls", "none"] as const;
 export const INBOUND_NETWORKS = ["tcp", "grpc", "xhttp", "ws"] as const;
 /** vision живёт только на tcp: на мультиплексируемых транспортах Xray его не принимает. */
 export const INBOUND_FLOWS = ["", "xtls-rprx-vision"] as const;
@@ -286,7 +288,10 @@ export function assertInboundShape(row: {
   network: string;
   flow: string;
 }): void {
-  if (row.security === "reality" && !row.sni) bad("sni: обязателен при security=reality");
+  // reality — sni задаёт dest/serverNames; tls — serverName сертификата. none (CDN терминирует) sni не требует.
+  if ((row.security === "reality" || row.security === "tls") && !row.sni) {
+    bad(`sni: обязателен при security=${row.security}`);
+  }
   if (row.flow === "xtls-rprx-vision" && row.network !== "tcp") {
     bad(`flow: xtls-rprx-vision работает только на network=tcp (сейчас ${row.network})`);
   }

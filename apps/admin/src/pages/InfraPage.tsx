@@ -1475,6 +1475,8 @@ function LocationWizard({
   const [tag, setTag] = useState("");
   const [roles, setRoles] = useState<string[]>(["exit"]);
   const [fingerprint, setFingerprint] = useState("firefox");
+  const [format, setFormat] = useState<"reality" | "cdn">("reality");
+  const [serviceName, setServiceName] = useState("");
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1500,6 +1502,18 @@ function LocationWizard({
     setBusy(true);
     setError(null);
     try {
+      // CDN (вариант A): нода за CDN без TLS (security=none) + grpc; клиент шифрует TLS до CDN.
+      // sni здесь = CDN-домен (он же адрес клиента). Reality: sni = домен-маскировка.
+      const formatFields =
+        format === "cdn"
+          ? {
+              security: "none",
+              network: "grpc",
+              flow: "",
+              params: { serviceName: serviceName.trim() },
+              hostAddress: sni.trim(),
+            }
+          : {};
       const res = await provisionLocation({
         name: name.trim(),
         primaryIp: primaryIp.trim(),
@@ -1511,6 +1525,7 @@ function LocationWizard({
         roles,
         fingerprint,
         squadIds: selectedSquads,
+        ...formatFields,
         ...sshBody(ssh),
       });
       setResult(res);
@@ -1611,13 +1626,37 @@ function LocationWizard({
           </select>
         </Field>
         <Field
+          label="Формат подключения"
+          hint="reality — прямой с маскировкой; CDN — vless+gRPC за CDN (TLS терминирует CDN)"
+        >
+          <select value={format} onChange={(e) => setFormat(e.target.value as "reality" | "cdn")}>
+            <option value="reality">Reality (прямой)</option>
+            <option value="cdn">CDN (gRPC)</option>
+          </select>
+        </Field>
+      </div>
+      {format === "reality" ? (
+        <Field
           label="Домен-маскировка (SNI)"
           required
           hint="под какой сайт маскируется Reality (TLS 1.3, не заблокирован). Есть пресеты."
         >
           <SniInput value={sni} onChange={setSni} />
         </Field>
-      </div>
+      ) : (
+        <div className="grid-2">
+          <Field
+            label="CDN-домен"
+            required
+            hint="домен за CDN (Cloudflare и т.п.), куда стучится клиент; CDN проксирует на ноду"
+          >
+            <input value={sni} onChange={(e) => setSni(e.target.value)} placeholder="cdn.example.com" />
+          </Field>
+          <Field label="gRPC serviceName" hint="совпадает с настройкой CDN и ноды; можно оставить пустым">
+            <input value={serviceName} onChange={(e) => setServiceName(e.target.value)} placeholder="grpc" />
+          </Field>
+        </div>
+      )}
 
       <h3 className="form-section">Выдавать в squad'ах</h3>
       {squads.length === 0 ? (

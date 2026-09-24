@@ -3,16 +3,22 @@
 
 export const VISION = "xtls-rprx-vision" as const;
 
-/** Reality-endpoint (host из подписки). */
+/** Endpoint из подписки. reality по умолчанию; для CDN-fronting — security=tls + транспорт. */
 export interface HostRef {
   address: string;
   port: number;
-  sni: string;
+  sni: string; // reality serverName / TLS serverName (для CDN — CDN-домен)
   fingerprint: string; // firefox
   pbk: string; // reality public key
   sid: string; // shortId
   flow: string; // xtls-rprx-vision (пусто на grpc/xhttp)
-  network?: string; // tcp
+  network?: string; // tcp | grpc | ws | xhttp
+  /** reality (default) | tls (CDN-fronting: клиент шифрует TLS до CDN-домена). */
+  security?: string;
+  alpn?: string[];
+  serviceName?: string; // grpc
+  path?: string; // ws/xhttp
+  host?: string; // ws/xhttp — Host-заголовок
 }
 
 /**
