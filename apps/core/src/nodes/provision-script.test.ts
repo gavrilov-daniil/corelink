@@ -34,7 +34,8 @@ describe("buildProvisionScript", () => {
   it("ставит Xray и сводит его конфиг на /etc/xray drop-in'ом", () => {
     const s = buildProvisionScript(base);
     assert.match(s, /Xray-install/);
-    assert.match(s, /xray\.service\.d\/10-corelink-config\.conf/);
+    // Префикс 90- обязателен: наш drop-in должен применяться ПОСЛЕ installer'ового 10-donot.
+    assert.match(s, /xray\.service\.d\/90-corelink-config\.conf/);
     assert.match(s, /xray run -config \/etc\/xray\/config\.json/);
   });
 

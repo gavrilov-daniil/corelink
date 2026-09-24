@@ -152,12 +152,16 @@ ${XRAY_BOOTSTRAP_CONFIG}
 XRAYCFG
 fi
 # Официальный unit читает /usr/local/etc/xray; агент пишет /etc/xray. Сводим на /etc/xray.
+# ВАЖНО про имя файла: installer кладёт свой drop-in 10-donot_touch_single_conf.conf со
+# своим путём, а systemd применяет drop-in'ы по имени лексикографически — последний
+# ExecStart= выигрывает. "10-corelink" < "10-donot", поэтому наш перебивался installer'ом
+# и Xray читал пустой конфиг. Префикс 90- гарантирует, что наш применяется последним.
 install -d -m 0755 /etc/systemd/system/xray.service.d
-cat > /etc/systemd/system/xray.service.d/10-corelink-config.conf <<'XRAYDROP'
+rm -f /etc/systemd/system/xray.service.d/10-corelink-config.conf
+cat > /etc/systemd/system/xray.service.d/90-corelink-config.conf <<'XRAYDROP'
 [Service]
 # Xray и агент — под одним пользователем node-agent: агент пишет /etc/xray/config.json
-# (там Reality-приватник, права 600), Xray его читает. Иначе два владельца дерутся за
-# файл. Ambient-права для bind на 443 сохраняем.
+# (там Reality-приватник, права 600), Xray его читает. Ambient-права для bind на 443.
 User=node-agent
 Group=node-agent
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
