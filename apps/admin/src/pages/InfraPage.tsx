@@ -3,7 +3,6 @@ import {
   FINGERPRINTS,
   INBOUND_FLOWS,
   INBOUND_NETWORKS,
-  NODE_ROLES,
   checkServerSsh,
   createConfigProfile,
   createHost,
@@ -320,6 +319,12 @@ export default function InfraPage() {
 
       {notice && <div className="notice">{notice}</div>}
 
+      <datalist id="sni-presets">
+        {SNI_PRESETS.map((d) => (
+          <option key={d} value={d} />
+        ))}
+      </datalist>
+
       {mode === "simple" && (
         <SimpleInfra
           nodes={nodes}
@@ -569,6 +574,29 @@ function toList(value: string): string[] {
 function toInt(value: string, fallback = 0): number {
   const n = Number(value.trim());
   return Number.isInteger(n) ? n : fallback;
+}
+
+// Пресеты Reality-маскировки: крупные сайты с TLS 1.3 + HTTP/2, обычно не заблокированные.
+// dest на ноде выводится из SNI как <sni>:443. Оператор может ввести и свой домен.
+const SNI_PRESETS = [
+  "registry-1.docker.io",
+  "production.cloudflare.docker.com",
+  "www.microsoft.com",
+  "www.apple.com",
+  "dl.google.com",
+  "github.githubassets.com",
+];
+
+/** Поле SNI-маскировки с подсказками-пресетами. datalist #sni-presets рендерится один раз в InfraPage. */
+function SniInput({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  return (
+    <input
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      placeholder="registry-1.docker.io"
+      list="sni-presets"
+    />
+  );
 }
 
 interface SshAccessValue {
@@ -910,7 +938,7 @@ function InboundModal({
 
       <div className="grid-2">
         <Field label="SNI" required hint="обязателен для reality">
-          <input value={sni} onChange={(e) => setSni(e.target.value)} placeholder="ads.x5.ru" />
+          <SniInput value={sni} onChange={setSni} />
         </Field>
         <Field label="Fingerprint">
           <select value={fingerprint} onChange={(e) => setFingerprint(e.target.value)}>
@@ -1045,7 +1073,7 @@ function HostModal({
 
       <div className="grid-2">
         <Field label="SNI">
-          <input value={sni} onChange={(e) => setSni(e.target.value)} placeholder="ads.x5.ru" />
+          <SniInput value={sni} onChange={setSni} />
         </Field>
         <Field label="Fingerprint">
           <select value={fingerprint} onChange={(e) => setFingerprint(e.target.value)}>
@@ -1467,8 +1495,6 @@ function LocationWizard({
 
   const toggleSquad = (id: string, on: boolean) =>
     setSelectedSquads((prev) => (on ? [...new Set([...prev, id])] : prev.filter((x) => x !== id)));
-  const toggleRole = (role: string, on: boolean) =>
-    setRoles((prev) => (on ? [...new Set([...prev, role])] : prev.filter((r) => r !== role)));
 
   const submit = async () => {
     setBusy(true);
@@ -1573,13 +1599,25 @@ function LocationWizard({
           <input value={port} onChange={(e) => setPort(e.target.value)} inputMode="numeric" />
         </Field>
       </div>
-      <Field
-        label="Домен-маскировка (SNI)"
-        required
-        hint="под какой сайт маскируется Reality: крупный домен с TLS 1.3, который не заблокирован"
-      >
-        <input value={sni} onChange={(e) => setSni(e.target.value)} placeholder="ads.x5.ru" />
-      </Field>
+      <div className="grid-2">
+        <Field
+          label="Тип узла"
+          hint="exit — обычный выход; relay/front — плечи для каскада и «через РФ» (связываются отдельно)"
+        >
+          <select value={roles[0] ?? "exit"} onChange={(e) => setRoles([e.target.value])}>
+            <option value="exit">Прямой выход (exit)</option>
+            <option value="relay">Транзит (relay)</option>
+            <option value="front">Фронт РФ (front)</option>
+          </select>
+        </Field>
+        <Field
+          label="Домен-маскировка (SNI)"
+          required
+          hint="под какой сайт маскируется Reality (TLS 1.3, не заблокирован). Есть пресеты."
+        >
+          <SniInput value={sni} onChange={setSni} />
+        </Field>
+      </div>
 
       <h3 className="form-section">Выдавать в squad'ах</h3>
       {squads.length === 0 ? (
@@ -1620,20 +1658,6 @@ function LocationWizard({
               </option>
             ))}
           </select>
-        </Field>
-        <Field label="Роли" hint="по умолчанию exit">
-          <div className="checks">
-            {NODE_ROLES.map((role) => (
-              <label key={role} className="check">
-                <input
-                  type="checkbox"
-                  checked={roles.includes(role)}
-                  onChange={(e) => toggleRole(role, e.target.checked)}
-                />
-                <span>{role}</span>
-              </label>
-            ))}
-          </div>
         </Field>
       </details>
     </Modal>
