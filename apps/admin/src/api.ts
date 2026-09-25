@@ -67,6 +67,8 @@ const post = (body?: unknown): RequestInit =>
 
 const patch = (body: unknown): RequestInit => ({ ...post(body), method: "PATCH" });
 
+const put = (body: unknown): RequestInit => ({ ...post(body), method: "PUT" });
+
 const del = (): RequestInit => ({ method: "DELETE" });
 
 // --- Вход, операторы, роли --------------------------------------------------
@@ -591,6 +593,8 @@ export interface ProvisionResult {
   inbound: ProvisionedRef;
   host: ProvisionedRef;
   squads: { id: string; name: string; attached: boolean }[];
+  /** Куда локация попала в выдаче; null — не выходная нода (relay/front). */
+  delivery: { channelTag: string; tier: number; profiles: string[] } | null;
   rebuilt: RebuildInfo[];
 }
 
@@ -621,6 +625,11 @@ export interface ProvisionInput {
   params?: Record<string, unknown>;
   /** Адрес, куда стучится клиент (для CDN — CDN-домен; по умолчанию = primaryIp). */
   hostAddress?: string;
+  /** Эшелон в подписке: 1 основной, 2 резерв, 3 последний резерв. По умолчанию 1. */
+  tier?: number;
+  /** Класть ли локацию в «🔀 Авто» и в профиль страны (по умолчанию — да; false = исключить). */
+  inAuto?: boolean;
+  inCountry?: boolean;
   /** SSH-доступ к серверу для последующей авто-настройки; секреты шифруются в БД, наружу не отдаются. */
   sshAuthType?: SshAuthType;
   sshUser?: string | null;
@@ -637,6 +646,25 @@ export const provisionLocation = (body: ProvisionInput) =>
 /** Каскадное удаление локации: сервер + нода(ы) со всей цепочкой. Отвергается, если локация в работе. */
 export const deleteLocation = (serverId: string) =>
   request<{ ok: boolean; removedNodes: number }>(`/api/admin/infra/locations/${serverId}`, del());
+
+/** Выдача локации клиентам: эшелон и членство в «Авто»/профиле страны. */
+export interface LocationDelivery {
+  nodeId: string;
+  /** Канал локации заведён (у локаций, созданных до авто-выдачи, может не быть). */
+  wired: boolean;
+  tier: number | null;
+  inAuto: boolean;
+  inCountry: boolean;
+  countryProfile: string | null;
+}
+
+export const getLocationDelivery = () => request<LocationDelivery[]>("/api/admin/infra/locations/delivery");
+
+export const setLocationDelivery = (serverId: string, body: { tier: number; inAuto: boolean; inCountry: boolean }) =>
+  request<{ channelTag: string; tier: number; profiles: string[] }>(
+    `/api/admin/infra/locations/${serverId}/delivery`,
+    put(body),
+  );
 
 // --- авто-настройка сервера по SSH ------------------------------------------
 

@@ -106,28 +106,30 @@ const BLOCK = { tag: "block", protocol: "blackhole" };
 /** Строит ОДИН полный Xray-конфиг для профиля (свой балансер, observatory, loopback, split). */
 export function buildProfileConfig(input: GeneratorInput, profile: ProfileInput): XrayConfig {
   const byTag = new Map(input.channels.map((c) => [c.tag, c]));
-  const primary = profile.primary.map((t) => must(byTag, t));
-  const fallback = profile.fallback.map((t) => must(byTag, t));
-
-  const hasFallback = fallback.length > 0;
-  const hasCascade = [...primary, ...fallback].some((c) => c.kind === "cascade");
+  // Эшелоны по порядку: tier1 → tier2 → tier3. Пустые выбрасываем: балансер с пустым
+  // селектором — клиент без интернета, а переход в пустой эшелон — петля реинжекта.
+  const tiers = [profile.primary, profile.fallback, profile.reserve ?? []]
+    .filter((t) => t.length > 0)
+    .map((t) => t.map((tag) => must(byTag, tag)));
+  const channels = tiers.flat();
+  const hasCascade = channels.some((c) => c.kind === "cascade");
+  // переход k: эшелон k → эшелон k+1 через loopback lo-out-k → lo-in-k
+  const hops = Math.max(tiers.length - 1, 0);
 
   // --- outbounds ---
-  const outbounds: Array<Record<string, unknown>> = [];
-  for (const ch of primary) outbounds.push(channelOutbound(ch, input));
-  for (const ch of fallback) outbounds.push(channelOutbound(ch, input));
+  const outbounds: Array<Record<string, unknown>> = channels.map((ch) => channelOutbound(ch, input));
   if (hasCascade && input.front) outbounds.push(frontOutbound(input.front, input.vlessUuid));
   outbounds.push({ ...FREEDOM });
   outbounds.push({ ...BLOCK });
-  if (hasFallback) {
-    outbounds.push({ tag: "lo-out-1", protocol: "loopback", settings: { inboundTag: "lo-in-1" } });
+  for (let k = 1; k <= hops; k++) {
+    outbounds.push({ tag: `lo-out-${k}`, protocol: "loopback", settings: { inboundTag: `lo-in-${k}` } });
   }
 
   // --- inbounds ---
   const inbounds = userInbounds();
-  if (hasFallback) {
+  for (let k = 1; k <= hops; k++) {
     inbounds.push({
-      tag: "lo-in-1",
+      tag: `lo-in-${k}`,
       listen: "127.0.0.1",
       port: 0,
       protocol: "dokodemo-door",
@@ -139,33 +141,32 @@ export function buildProfileConfig(input: GeneratorInput, profile: ProfileInput)
   // Так устроены боевые профили «Россия» и «Белые списки» (сверено спайком golden-diff).
   // Балансер из одного кандидата не даёт ничего, но тянет за собой observatory
   // и лишние пробы через канал.
-  const singleChannel = !hasFallback && primary.length === 1 ? primary[0] : null;
+  const singleChannel = tiers.length === 1 && tiers[0].length === 1 ? tiers[0][0] : null;
 
-  // --- balancers (tier1 direct, tier2 cascade). Последний tier — БЕЗ fallbackTag. ---
+  // --- balancers: по одному на эшелон. Все, кроме последнего, — leastPing с переходом на
+  // следующий через loopback. Последний — БЕЗ fallbackTag (иначе вечная петля реинжекта),
+  // а при нескольких эшелонах — random: резервные плечи равнозначны, пробы через них
+  // дороги. Так 2-тировый вывод совпадает с боевой панелью байт-в-байт (golden-diff). ---
   const balancers: Array<Record<string, unknown>> = [];
-  if (singleChannel) {
-    // балансеров нет вовсе
-  } else if (hasFallback) {
-    balancers.push({
-      tag: "tier1",
-      selector: primary.map((c) => c.tag),
-      fallbackTag: "lo-out-1",
-      strategy: { type: "leastPing" },
+  if (!singleChannel) {
+    tiers.forEach((tier, i) => {
+      const last = i === tiers.length - 1;
+      balancers.push({
+        tag: `tier${i + 1}`,
+        selector: tier.map((c) => c.tag),
+        ...(last ? {} : { fallbackTag: `lo-out-${i + 1}` }),
+        strategy: { type: last && tiers.length > 1 ? "random" : "leastPing" },
+      });
     });
-    // резервный тир: плечи равнозначны, а пробы через каскад дороги — как в бою
-    balancers.push({ tag: "tier2", selector: fallback.map((c) => c.tag), strategy: { type: "random" } });
-  } else {
-    const only = primary.length ? primary : fallback;
-    balancers.push({ tag: "tier1", selector: only.map((c) => c.tag), strategy: { type: "leastPing" } });
   }
 
   // --- routing rules ---
   const ruSplit = profile.ruSplit !== false;
   const { head } = buildSplitRoutingHead(input.domainList, ruSplit);
   const rules = [...head];
-  if (hasFallback) {
-    // loopback-реинжект ДО catch-all
-    rules.push({ type: "field", inboundTag: ["lo-in-1"], balancerTag: "tier2" });
+  // loopback-реинжект ДО catch-all: трафик, вернувшийся из эшелона k, уходит в k+1
+  for (let k = 1; k <= hops; k++) {
+    rules.push({ type: "field", inboundTag: [`lo-in-${k}`], balancerTag: `tier${k + 1}` });
   }
   rules.push(
     singleChannel

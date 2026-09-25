@@ -66,6 +66,51 @@ test("CDN-канал: клиентский outbound tls + grpc + serviceName, б
   assert.ok(!out.streamSettings.realitySettings, "для tls reality-настроек быть не должно");
 });
 
+test("три эшелона: tier1 → tier2 → tier3 цепочкой loopback, последний без fallbackTag", () => {
+  const profile: ProfileInput = {
+    remark: "🔀 Авто",
+    primary: ["de-direct"],
+    fallback: ["pl-direct"],
+    reserve: ["pl-cascade"],
+  };
+  const cfg = buildProfileConfig(fixture(), profile) as any;
+  const [t1, t2, t3] = cfg.routing.balancers;
+  assert.deepEqual(
+    [t1.tag, t2.tag, t3.tag],
+    ["tier1", "tier2", "tier3"],
+  );
+  assert.equal(t1.fallbackTag, "lo-out-1");
+  assert.equal(t2.fallbackTag, "lo-out-2");
+  assert.equal(t3.fallbackTag, undefined, "последний эшелон — без перехода, иначе петля");
+  assert.equal(t1.strategy.type, "leastPing");
+  assert.equal(t2.strategy.type, "leastPing", "промежуточный эшелон с переходом обязан быть leastPing");
+  assert.equal(t3.strategy.type, "random");
+  const reinject = cfg.routing.rules.filter((r: any) => r.inboundTag?.[0]?.startsWith("lo-in-"));
+  assert.deepEqual(
+    reinject.map((r: any) => [r.inboundTag[0], r.balancerTag]),
+    [
+      ["lo-in-1", "tier2"],
+      ["lo-in-2", "tier3"],
+    ],
+  );
+  const res = validateConfig(cfg);
+  assert.deepEqual(res.errors, []);
+});
+
+test("пустой средний эшелон схлопывается: tier1 → tier3 становится tier1 → tier2", () => {
+  const cfg = buildProfileConfig(fixture(), {
+    remark: "PL",
+    primary: ["pl-direct"],
+    fallback: [],
+    reserve: ["pl-cascade"],
+  }) as any;
+  assert.deepEqual(
+    cfg.routing.balancers.map((b: any) => b.tag),
+    ["tier1", "tier2"],
+  );
+  assert.ok(validateConfig(cfg).ok);
+});
+
 test("двухтирный профиль: loopback-цепочка целостна, последний tier без fallbackTag", () => {
   const input = fixture();
   const profile: ProfileInput = { remark: "🇵🇱 Польша", primary: ["pl-direct"], fallback: ["pl-cascade"] };

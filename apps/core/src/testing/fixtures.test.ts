@@ -211,6 +211,7 @@ export interface ProfileSpec {
   ruSplit?: boolean;
   primary: string[];
   fallback?: string[];
+  reserve?: string[]; // tier 3
 }
 
 export interface NetworkSpec {
@@ -332,6 +333,7 @@ export async function seedNetwork(db: Database, spec: NetworkSpec) {
     const rows = [
       ...p.primary.map((key, i) => ({ key, tier: 1, sortOrder: i })),
       ...(p.fallback ?? []).map((key, i) => ({ key, tier: 2, sortOrder: i })),
+      ...(p.reserve ?? []).map((key, i) => ({ key, tier: 3, sortOrder: i })),
     ];
     for (const r of rows) {
       const channelId = channelIdByKey.get(r.key);

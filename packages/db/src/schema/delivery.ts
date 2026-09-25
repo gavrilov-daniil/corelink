@@ -25,7 +25,12 @@ export const profile = pgTable("profile", {
   // false — профили «Россия»/«Белые списки»: РФ-ресурсы идут ЧЕРЕЗ туннель,
   // правило «РФ-домены → freedom» для них не добавляется
   ruSplit: boolean("ru_split").notNull().default(true),
-});
+}, (t) => [
+  // Имя — натуральный ключ: по нему мастер локации находит «🔀 Авто»/профиль страны, а
+  // будущий импорт с панели — уже заведённый профиль. Два профиля с одним именем — это
+  // две одинаковые строки в списке у клиента.
+  uniqueIndex("profile_org_remark_uq").on(t.orgId, t.remark),
+]);
 
 // Канал: direct = outbound как есть; cascade = клон exit-outbound с dialerProxy=front, оба плеча flow=vision.
 export const channel = pgTable("channel", {
@@ -41,7 +46,11 @@ export const channel = pgTable("channel", {
   // без этой связи subgen не может проверить готовность каскада и публикует канал,
   // у которого одно плечо ещё не применило конфиг — трафик клиента уходит в никуда
   cascadeLinkId: uuid("cascade_link_id").references(() => cascadeLink.id),
-});
+}, (t) => [
+  // Тег — это тег outbound'а в клиентском конфиге: два канала с одним тегом дают битый
+  // конфиг. Заодно ключ идемпотентности канала локации (тег выводится из id ноды).
+  uniqueIndex("channel_org_tag_uq").on(t.orgId, t.tag),
+]);
 
 // Какие каналы в профиле и на каком tier'е (1 = primary/direct, 2 = fallback/cascade).
 export const profileChannel = pgTable("profile_channel", {

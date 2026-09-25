@@ -46,12 +46,17 @@ export interface DomainList {
   ipCidrs?: string[]; // РФ IP-CIDR → freedom
 }
 
-/** Профиль подписки: primary=tier1 (direct), fallback=tier2 (cascade). */
+/**
+ * Профиль подписки — эшелоны по порядку: primary (tier1) → fallback (tier2) → reserve (tier3).
+ * Внутри эшелона клиент выбирает канал сам; следующий эшелон включается, только когда
+ * отказали все каналы предыдущего.
+ */
 export interface ProfileInput {
   remark: string; // "🔀 Авто" | "🇩🇪 Германия" | ...
   isAuto?: boolean;
   primary: string[]; // теги каналов tier1
   fallback: string[]; // теги каналов tier2 (может быть пусто → один тир)
+  reserve?: string[]; // теги каналов tier3 — последний резерв
   /**
    * Выводить ли РФ-трафик мимо туннеля (default true).
    * false — для профилей вида «Россия» / «Белые списки», где РФ-ресурсы нужны

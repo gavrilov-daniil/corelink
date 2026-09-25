@@ -8,6 +8,13 @@ import { NodeStateService } from "./node-state.service.js";
 import { probeSsh } from "./ssh-probe.js";
 import { resolveServerSsh } from "./server-ssh.js";
 import {
+  applyLocationDelivery,
+  locationChannelTag,
+  readLocationDelivery,
+  type LocationDeliveryResult,
+  type LocationDeliveryState,
+} from "./location-delivery.js";
+import {
   FINGERPRINTS,
   INBOUND_FLOWS,
   INBOUND_NETWORKS,
@@ -76,6 +83,8 @@ export interface ProvisionResult {
   inbound: ProvisionedRef;
   host: ProvisionedRef;
   squads: Array<{ id: string; name: string; attached: boolean }>;
+  /** Куда локация попала в выдаче (null — не выходная нода, прямого канала нет). */
+  delivery: LocationDeliveryResult | null;
   rebuilt: RebuildInfo[];
 }
 
@@ -313,8 +322,10 @@ export class InfraService {
           "каскад",
         )),
         ...(await this.refCount(sql`select count(*)::int as n from channel where front_node_id = ${n.id}`, "канал подписки (front)")),
+        // собственный канал локации (заведён мастером) — не блокер: он уходит вместе с ней
         ...(await this.refCount(
-          sql`select count(*)::int as n from channel c join host h on h.id = c.host_id where h.node_id = ${n.id}`,
+          sql`select count(*)::int as n from channel c join host h on h.id = c.host_id
+            where h.node_id = ${n.id} and c.tag <> ${locationChannelTag(n.id)}`,
           "канал подписки",
         )),
         ...(await this.refCount(sql`select count(*)::int as n from traffic_sample where node_id = ${n.id}`, "запись трафика")),
@@ -339,6 +350,16 @@ export class InfraService {
         if (inbIds.length > 0) {
           await tx.delete(schema.squadInbound).where(inArray(schema.squadInbound.inboundId, inbIds));
         }
+        // канал локации и её членства в профилях — до хоста: channel.host_id → host
+        const own = await tx
+          .select({ id: schema.channel.id })
+          .from(schema.channel)
+          .where(and(eq(schema.channel.orgId, this.org), eq(schema.channel.tag, locationChannelTag(n.id))));
+        if (own.length > 0) {
+          const ownIds = own.map((c) => c.id);
+          await tx.delete(schema.profileChannel).where(inArray(schema.profileChannel.channelId, ownIds));
+          await tx.delete(schema.channel).where(inArray(schema.channel.id, ownIds));
+        }
         await tx.delete(schema.host).where(eq(schema.host.nodeId, n.id));
         if (inbIds.length > 0) {
           await tx.delete(schema.inbound).where(inArray(schema.inbound.id, inbIds));
@@ -357,6 +378,55 @@ export class InfraService {
     });
 
     return { ok: true, removedNodes: nodes.length };
+  }
+
+  /**
+   * Правка выдачи локации: тир-эшелон и членство в «Авто»/профиле страны (снял галочку =
+   * исключил). Заодно подключает к выдаче локации, заведённые до авто-выдачи.
+   */
+  async setLocationDelivery(serverId: string, body: Raw) {
+    requireUuid(serverId);
+    const server = await this.getServerRow(serverId);
+    const tier = num(body, "tier", { required: true, min: 1, max: 3 })!;
+    const inAuto = bool(body, "inAuto") ?? true;
+    const inCountry = bool(body, "inCountry") ?? true;
+
+    const nodes = await this.db
+      .select({ id: schema.node.id, roles: schema.node.roles })
+      .from(schema.node)
+      .where(and(eq(schema.node.orgId, this.org), eq(schema.node.serverId, serverId)));
+    const exit = nodes.find((n) => n.roles.includes("exit"));
+    if (!exit) bad("выдача клиентам — только у выходной ноды (exit); relay/front — плечи каскада");
+
+    const [host] = await this.db
+      .select({ id: schema.host.id })
+      .from(schema.host)
+      .where(eq(schema.host.nodeId, exit.id))
+      .orderBy(schema.host.sortOrder)
+      .limit(1);
+    if (!host) bad("у ноды нет endpoint'а (host) — клиенту нечего выдать");
+
+    return this.db.transaction((tx) =>
+      applyLocationDelivery(tx, {
+        org: this.org,
+        nodeId: exit.id,
+        hostId: host.id,
+        country: server.country,
+        tier,
+        inAuto,
+        inCountry,
+      }),
+    );
+  }
+
+  /** Состояние выдачи всех локаций — для строк простого режима. */
+  async listLocationDelivery(): Promise<LocationDeliveryState[]> {
+    const nodes = await this.db
+      .select({ id: schema.node.id, country: schema.server.country })
+      .from(schema.node)
+      .innerJoin(schema.server, eq(schema.server.id, schema.node.serverId))
+      .where(eq(schema.node.orgId, this.org));
+    return readLocationDelivery(this.db, this.org, nodes);
   }
 
   // --- config-профили --------------------------------------------------------
@@ -1060,6 +1130,19 @@ export class InfraService {
         attached[s.id] = link.length > 0;
       }
 
+      // Выдача клиентам — в той же транзакции: локация без канала в профилях настроена,
+      // но ни в одну подписку не попадает. Только выходной ноде: relay/front — плечи
+      // каскада, прямого канала у них нет.
+      const delivery = nodeRow.roles.includes("exit")
+        ? await applyLocationDelivery(tx, {
+            org: this.org,
+            nodeId: nodeRow.id,
+            hostId: hostRow.id,
+            country: serverRow.country,
+            ...v.delivery,
+          })
+        : null;
+
       return {
         server: { id: serverRow.id, label: serverRow.hostname, created: serverCreated },
         configProfile: { id: profileRow.id, label: profileRow.name, created: profileCreated },
@@ -1067,6 +1150,7 @@ export class InfraService {
         inbound: { id: inboundRow.id, label: inboundRow.tag, created: inboundCreated },
         host: { id: hostRow.id, label: hostRow.remark, created: hostCreated },
         attached,
+        delivery,
       };
     });
 
@@ -1080,6 +1164,7 @@ export class InfraService {
       inbound: built.inbound,
       host: built.host,
       squads: squads.map((s) => ({ id: s.id, name: s.name, attached: built.attached[s.id] ?? false })),
+      delivery: built.delivery,
       rebuilt,
     };
   }
@@ -1130,7 +1215,22 @@ export class InfraService {
       flow,
     };
 
-    return { server, profileName: name, node: { name, roles }, inbound, host, squadIds: idList(body, "squadIds") };
+    // выдача клиентам: тир-эшелон и членство в «Авто»/профиле страны (по умолчанию — в обоих)
+    const delivery = {
+      tier: num(body, "tier", { min: 1, max: 3 }) ?? 1,
+      inAuto: bool(body, "inAuto") ?? true,
+      inCountry: bool(body, "inCountry") ?? true,
+    };
+
+    return {
+      server,
+      profileName: name,
+      node: { name, roles },
+      inbound,
+      host,
+      squadIds: idList(body, "squadIds"),
+      delivery,
+    };
   }
 
   /** squad'ы для привязки существуют в этом org? Пустой список — норма (можно завести локацию без выдачи). */

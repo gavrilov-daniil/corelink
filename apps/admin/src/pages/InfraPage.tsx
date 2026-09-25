@@ -25,6 +25,8 @@ import {
   provisionLocation,
   provisionServer,
   getProvisionRun,
+  getLocationDelivery,
+  setLocationDelivery,
   updateConfigProfile,
   updateHost,
   updateInbound,
@@ -36,6 +38,7 @@ import {
   type Node,
   type ProvisionResult,
   type ProvisionRun,
+  type LocationDelivery,
   type RebuildInfo,
   type Server,
   type SshAuthType,
@@ -77,15 +80,16 @@ type Editing<T> = { kind: "create" } | { kind: "edit"; row: T } | null;
 
 export default function InfraPage() {
   const page = useResource(async () => {
-    const [servers, profiles, nodes, inbounds, hosts, squads] = await Promise.all([
+    const [servers, profiles, nodes, inbounds, hosts, squads, delivery] = await Promise.all([
       getServers(),
       getConfigProfiles(),
       getNodes(),
       getInbounds(),
       getHosts(),
       getSquads(),
+      getLocationDelivery(),
     ]);
-    return { servers, profiles, nodes, inbounds, hosts, squads };
+    return { servers, profiles, nodes, inbounds, hosts, squads, delivery };
   });
 
   const [serverForm, setServerForm] = useState<Editing<Server>>(null);
@@ -124,7 +128,7 @@ export default function InfraPage() {
   if (page.error) return <ErrorBox error={page.error} onRetry={page.reload} />;
   if (!page.data) return null;
 
-  const { servers, profiles, nodes, inbounds, hosts, squads } = page.data;
+  const { servers, profiles, nodes, inbounds, hosts, squads, delivery } = page.data;
   const profileName = (id: string) => profiles.find((p) => p.id === id)?.name ?? id;
 
   const serverColumns: Column<Server>[] = [
@@ -330,6 +334,7 @@ export default function InfraPage() {
           nodes={nodes}
           servers={servers}
           inbounds={inbounds}
+          delivery={delivery}
           onAdd={() => setWizardOpen(true)}
           onReload={() => page.reload()}
         />
@@ -1192,18 +1197,22 @@ function SimpleInfra({
   nodes,
   servers,
   inbounds,
+  delivery,
   onAdd,
   onReload,
 }: {
   nodes: Node[];
   servers: Server[];
   inbounds: Inbound[];
+  delivery: LocationDelivery[];
   onAdd: () => void;
   onReload: () => void;
 }) {
   // первый inbound ноды: в простом режиме на ноду заводится ровно один
   const inboundByNode = new Map<string, Inbound>();
   for (const i of inbounds) if (i.nodeId && !inboundByNode.has(i.nodeId)) inboundByNode.set(i.nodeId, i);
+  const deliveryByNode = new Map(delivery.map((d) => [d.nodeId, d]));
+  const [deliveryTarget, setDeliveryTarget] = useState<Node | null>(null);
 
   // серверы без ноды: в основную таблицу локаций не попадают, но почистить их надо где-то
   const orphanServers = servers.filter((s) => s.nodeCount === 0);
@@ -1258,6 +1267,11 @@ function SimpleInfra({
       render: (n) => inboundByNode.get(n.id)?.tag ?? <span className="muted">нет</span>,
     },
     {
+      key: "delivery",
+      title: "Выдача",
+      render: (n) => <DeliveryCell node={n} state={deliveryByNode.get(n.id)} />,
+    },
+    {
       key: "actions",
       title: "",
       align: "right",
@@ -1270,6 +1284,11 @@ function SimpleInfra({
           >
             Настроить
           </button>
+          {n.roles.includes("exit") && (
+            <button type="button" className="btn btn-sm" onClick={() => setDeliveryTarget(n)}>
+              Выдача
+            </button>
+          )}
           <button type="button" className="btn btn-sm btn-danger" onClick={() => void removeLocation(n)}>
             Удалить
           </button>
@@ -1285,9 +1304,9 @@ function SimpleInfra({
         subtitle="Локация = сервер с одной нодой. Мастер сам заведёт сервер, ноду, вход (inbound) и endpoint — вместо пяти форм."
       >
         <ol className="steps">
-          <li>«Добавить локацию» → имя, IP сервера и домен-маскировку (SNI).</li>
-          <li>Отметьте, в какие squad'ы (наборы доступа) выдавать — или пропустите.</li>
-          <li>Выпустите токен агента и поставьте агента на сервер: он сам заберёт конфиг и пришлёт ключи.</li>
+          <li>«Добавить локацию» → имя, IP, формат подключения, SSH-доступ и эшелон (tier).</li>
+          <li>Сервер настраивается сам по SSH — вы только смотрите лог.</li>
+          <li>Локация сразу попадает в подписку: в «🔀 Авто» и профиль своей страны (галочкой можно исключить).</li>
         </ol>
         <div className="row-actions">
           <button type="button" className="btn btn-primary" onClick={onAdd}>
@@ -1335,7 +1354,123 @@ function SimpleInfra({
           <ProvisionPanel serverId={provisionTarget.serverId} autoStart />
         </Modal>
       )}
+
+      {deliveryTarget && (
+        <DeliveryModal
+          node={deliveryTarget}
+          state={deliveryByNode.get(deliveryTarget.id)}
+          onClose={() => setDeliveryTarget(null)}
+          onSaved={() => {
+            setDeliveryTarget(null);
+            onReload();
+          }}
+        />
+      )}
     </>
+  );
+}
+
+const TIER_HINT: Record<number, string> = {
+  1: "основной эшелон — клиент берёт лучший по пингу среди tier 1",
+  2: "резерв — включается, только если недоступен весь tier 1",
+  3: "последний резерв — если недоступны tier 1 и tier 2",
+};
+
+function TierSelect({ value, onChange }: { value: number; onChange: (tier: number) => void }) {
+  return (
+    <select value={value} onChange={(e) => onChange(Number(e.target.value))}>
+      <option value={1}>1 — основной</option>
+      <option value={2}>2 — резерв</option>
+      <option value={3}>3 — последний резерв</option>
+    </select>
+  );
+}
+
+/** Где локация выдаётся клиентам: эшелон и профили. */
+function DeliveryCell({ node, state }: { node: Node; state?: LocationDelivery }) {
+  if (!node.roles.includes("exit")) return <span className="muted small">плечо каскада</span>;
+  if (!state?.wired || (!state.inAuto && !state.inCountry)) {
+    return <span className="muted small">не выдаётся</span>;
+  }
+  const where = [state.inAuto && "Авто", state.inCountry && state.countryProfile].filter(Boolean).join(", ");
+  return (
+    <span className="small">
+      <span className="strong">tier {state.tier}</span> · {where}
+    </span>
+  );
+}
+
+/** Правка выдачи: эшелон и членство в «Авто»/профиле страны. Снятая галочка — исключение. */
+function DeliveryModal({
+  node,
+  state,
+  onClose,
+  onSaved,
+}: {
+  node: Node;
+  state?: LocationDelivery;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  // у локации без канала (заведена до авто-выдачи) по умолчанию предлагаем выдавать везде
+  const [tier, setTier] = useState(state?.tier ?? 1);
+  const [inAuto, setInAuto] = useState(state?.wired ? state.inAuto : true);
+  const [inCountry, setInCountry] = useState(state?.wired ? state.inCountry : true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const save = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await setLocationDelivery(node.serverId, { tier, inAuto, inCountry });
+      onSaved();
+    } catch (e) {
+      setError(errorMessage(e));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal
+      title={`Выдача: ${node.name}`}
+      onClose={onClose}
+      footer={
+        <>
+          {error && <span className="err">{error}</span>}
+          <button type="button" className="btn" onClick={onClose}>
+            Отмена
+          </button>
+          <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void save()}>
+            {busy ? "Сохраняем…" : "Сохранить"}
+          </button>
+        </>
+      }
+    >
+      <Field label="Эшелон (tier)" hint={TIER_HINT[tier]}>
+        <TierSelect value={tier} onChange={setTier} />
+      </Field>
+      <div className="checks">
+        <label className="check">
+          <input type="checkbox" checked={inAuto} onChange={(e) => setInAuto(e.target.checked)} />
+          <span>в «🔀 Авто»</span>
+        </label>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={inCountry && Boolean(state?.countryProfile)}
+            disabled={!state?.countryProfile}
+            onChange={(e) => setInCountry(e.target.checked)}
+          />
+          <span>
+            {state?.countryProfile ? `в «${state.countryProfile}»` : "в профиль страны — у локации не задан код страны"}
+          </span>
+        </label>
+      </div>
+      <p className="muted small">
+        Снятая галочка исключает локацию из профиля. Клиенты получат изменение при следующем обновлении подписки.
+      </p>
+    </Modal>
   );
 }
 
@@ -1477,6 +1612,10 @@ function LocationWizard({
   const [fingerprint, setFingerprint] = useState("firefox");
   const [format, setFormat] = useState<"reality" | "cdn">("reality");
   const [serviceName, setServiceName] = useState("");
+  // выдача клиентам: эшелон и профили (по умолчанию — «Авто» и страна, tier 1)
+  const [tier, setTier] = useState(1);
+  const [inAuto, setInAuto] = useState(true);
+  const [inCountry, setInCountry] = useState(true);
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1525,6 +1664,9 @@ function LocationWizard({
         roles,
         fingerprint,
         squadIds: selectedSquads,
+        tier,
+        inAuto,
+        inCountry,
         ...formatFields,
         ...sshBody(ssh),
       });
@@ -1556,6 +1698,15 @@ function LocationWizard({
         </ul>
         {result.squads.length > 0 && (
           <p className="small">Выдаётся в squad'ах: {result.squads.map((s) => s.name).join(", ")}.</p>
+        )}
+        {result.delivery ? (
+          <p className="small">
+            {result.delivery.profiles.length > 0
+              ? `В подписке: ${result.delivery.profiles.join(", ")} · tier ${result.delivery.tier}.`
+              : "Исключена из всех профилей — клиенты её не получат, пока не включите выдачу."}
+          </p>
+        ) : (
+          <p className="muted small">Узел relay/front — плечо каскада, клиентам напрямую не выдаётся.</p>
         )}
         {sshConfigured && (
           <div className="provision-ssh-check">
@@ -1656,6 +1807,37 @@ function LocationWizard({
             <input value={serviceName} onChange={(e) => setServiceName(e.target.value)} placeholder="grpc" />
           </Field>
         </div>
+      )}
+
+      {(roles[0] ?? "exit") === "exit" && (
+        <>
+          <h3 className="form-section">Выдача клиентам</h3>
+          <div className="grid-2">
+            <Field label="Эшелон (tier)" hint={TIER_HINT[tier]}>
+              <TierSelect value={tier} onChange={setTier} />
+            </Field>
+            <Field label="Профили подписки" hint="снятая галочка — локация исключена из профиля">
+              <div className="checks">
+                <label className="check">
+                  <input type="checkbox" checked={inAuto} onChange={(e) => setInAuto(e.target.checked)} />
+                  <span>в «🔀 Авто»</span>
+                </label>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={inCountry && /^[A-Za-z]{2}$/.test(country.trim())}
+                    disabled={!/^[A-Za-z]{2}$/.test(country.trim())}
+                    onChange={(e) => setInCountry(e.target.checked)}
+                  />
+                  <span>
+                    в профиль своей страны
+                    {/^[A-Za-z]{2}$/.test(country.trim()) ? ` (${country.trim().toUpperCase()})` : " — укажите код страны"}
+                  </span>
+                </label>
+              </div>
+            </Field>
+          </div>
+        </>
       )}
 
       <h3 className="form-section">Выдавать в squad'ах</h3>

@@ -15,6 +15,7 @@ import { isEncrypted } from "@corelink/core-kit";
 import { TEST_ORG_ID, cleanupOrg, closeDb, createSubscriber, createSubscription, openDb } from "../testing/fixtures.test.js";
 import { NodeStateService } from "./node-state.service.js";
 import { InfraService } from "./infra.service.js";
+import { locationChannelTag } from "./location-delivery.js";
 
 let db: Database;
 let infra: InfraService;
@@ -580,5 +581,104 @@ describe("удаление локации", () => {
 
     await assert.rejects(() => infra.deleteLocation(res.server.id), (e) => status(e) === 409);
     assert.equal((await db.select().from(schema.server).where(eq(schema.server.id, res.server.id))).length, 1);
+  });
+});
+
+describe("выдача локации клиентам (тир и профили)", () => {
+  /** Членство канала локации в профилях: [имя профиля, тир], по имени. */
+  async function memberships(nodeId: string): Promise<Array<[string, number]>> {
+    const rows = await db
+      .select({ remark: schema.profile.remark, tier: schema.profileChannel.tier })
+      .from(schema.profileChannel)
+      .innerJoin(schema.channel, eq(schema.channel.id, schema.profileChannel.channelId))
+      .innerJoin(schema.profile, eq(schema.profile.id, schema.profileChannel.profileId))
+      .where(eq(schema.channel.tag, locationChannelTag(nodeId)));
+    return rows.map((r): [string, number] => [r.remark, r.tier]).sort((a, b) => a[0].localeCompare(b[0]));
+  }
+
+  const provision = (extra: Record<string, unknown> = {}) =>
+    infra.provisionLocation({
+      name: "de-exit",
+      primaryIp: "203.0.113.30",
+      sni: "ads.x5.ru",
+      country: "DE",
+      ...extra,
+    });
+
+  it("выходная локация сразу попадает в «Авто» и профиль страны с выбранным тиром", async () => {
+    const res = await provision({ tier: 2 });
+
+    assert.deepEqual(res.delivery?.profiles, ["🔀 Авто", "🇩🇪 Германия"]);
+    assert.deepEqual(await memberships(res.node.id), [
+      ["🇩🇪 Германия", 2],
+      ["🔀 Авто", 2],
+    ]);
+  });
+
+  it("исключение: без галочки «Авто» локация есть только в профиле страны", async () => {
+    const res = await provision({ inAuto: false });
+    assert.deepEqual(await memberships(res.node.id), [["🇩🇪 Германия", 1]]);
+  });
+
+  it("повторный мастер не плодит ни канал, ни профили, ни привязки", async () => {
+    await provision();
+    const res = await provision();
+
+    const channels = await db.select().from(schema.channel).where(eq(schema.channel.tag, locationChannelTag(res.node.id)));
+    const profiles = await db.select().from(schema.profile).where(eq(schema.profile.orgId, TEST_ORG_ID));
+    assert.equal(channels.length, 1);
+    assert.equal(profiles.length, 2, "«Авто» и «Германия» — по одному");
+    assert.equal((await memberships(res.node.id)).length, 2);
+  });
+
+  it("relay-нода в выдачу не попадает: это плечо каскада, прямого канала у неё нет", async () => {
+    const res = await provision({ roles: ["relay"] });
+
+    assert.equal(res.delivery, null);
+    const channels = await db.select().from(schema.channel).where(eq(schema.channel.tag, locationChannelTag(res.node.id)));
+    assert.equal(channels.length, 0);
+  });
+
+  it("тир вне 1..3 отвергается на границе", async () => {
+    await assert.rejects(() => provision({ tier: 4 }), (e) => status(e) === 400);
+  });
+
+  it("правка выдачи: смена тира и исключение из профиля страны", async () => {
+    const res = await provision({ tier: 1 });
+    await infra.setLocationDelivery(res.server.id, { tier: 3, inAuto: true, inCountry: false });
+    assert.deepEqual(await memberships(res.node.id), [["🔀 Авто", 3]]);
+
+    // и обратно: вернуть в профиль страны
+    await infra.setLocationDelivery(res.server.id, { tier: 3, inAuto: true, inCountry: true });
+    assert.deepEqual(await memberships(res.node.id), [
+      ["🇩🇪 Германия", 3],
+      ["🔀 Авто", 3],
+    ]);
+  });
+
+  it("удаление локации уносит её канал и привязки, общие профили остаются", async () => {
+    const res = await provision();
+    await infra.deleteLocation(res.server.id);
+
+    const channels = await db.select().from(schema.channel).where(eq(schema.channel.tag, locationChannelTag(res.node.id)));
+    assert.equal(channels.length, 0);
+    const links = await db.select().from(schema.profileChannel).where(eq(schema.profileChannel.orgId, TEST_ORG_ID));
+    assert.equal(links.length, 0);
+    const profiles = await db.select().from(schema.profile).where(eq(schema.profile.orgId, TEST_ORG_ID));
+    assert.equal(profiles.length, 2, "в профилях могут быть другие локации — их не трогаем");
+  });
+
+  it("состояние выдачи для списка локаций", async () => {
+    const res = await provision({ tier: 2, inCountry: false });
+    const state = (await infra.listLocationDelivery()).find((s) => s.nodeId === res.node.id);
+
+    assert.deepEqual(state, {
+      nodeId: res.node.id,
+      wired: true,
+      tier: 2,
+      inAuto: true,
+      inCountry: false,
+      countryProfile: "🇩🇪 Германия",
+    });
   });
 });

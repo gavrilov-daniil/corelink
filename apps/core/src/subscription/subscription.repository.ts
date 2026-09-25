@@ -209,19 +209,20 @@ export class SubscriptionRepository {
           .map(tag)
           .filter((t) => availableTags.has(t));
 
-      const primary = pick(1);
-      const fallback = pick(2);
-      if (primary.length === 0 && fallback.length === 0) {
+      // Эшелоны 1-3; пустые схлопываем: если в tier1 не осталось доступных каналов,
+      // первым эшелоном становится следующий непустой — клиент не остаётся без tier1.
+      const tiers = [pick(1), pick(2), pick(3)].filter((t) => t.length > 0);
+      if (tiers.length === 0) {
         this.log.warn(`профиль «${p.remark}» пропущен: не осталось доступных каналов`);
         continue;
       }
-      // если пуст только primary — поднимаем fallback, чтобы не остаться без tier1
       profiles.push({
         remark: p.remark,
         isAuto: p.isAuto,
         ruSplit: p.ruSplit,
-        primary: primary.length > 0 ? primary : fallback,
-        fallback: primary.length > 0 ? fallback : [],
+        primary: tiers[0],
+        fallback: tiers[1] ?? [],
+        ...(tiers[2] ? { reserve: tiers[2] } : {}),
       });
     }
     return profiles;

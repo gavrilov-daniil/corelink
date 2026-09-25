@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post } from "@nestjs/common";
+import { Body, Controller, Delete, Get, Param, Patch, Post, Put } from "@nestjs/common";
 import { InfraService } from "./infra.service.js";
 import { ProvisionService } from "./provision.service.js";
 import type { Raw } from "./infra.validation.js";
@@ -31,6 +31,17 @@ export class InfraAdminController {
   @Delete("infra/locations/:serverId")
   deleteLocation(@Param("serverId") serverId: string) {
     return this.infra.deleteLocation(serverId);
+  }
+
+  /** Выдача локаций клиентам: тир и членство в «Авто»/профиле страны. */
+  @Get("infra/locations/delivery")
+  listLocationDelivery() {
+    return this.infra.listLocationDelivery();
+  }
+
+  @Put("infra/locations/:serverId/delivery")
+  setLocationDelivery(@Param("serverId") serverId: string, @Body() body: Raw) {
+    return this.infra.setLocationDelivery(serverId, body ?? {});
   }
 
   // --- серверы ---

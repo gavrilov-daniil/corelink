@@ -331,6 +331,29 @@ describe("Выдача подписки: что попадает в конфиг
     assert.equal(balancers[0].fallbackTag, "lo-out-1");
   });
 
+  it("три эшелона из профиля доходят до клиента: tier1 → tier2 → tier3", async () => {
+    await seedNetwork(db, {
+      channels: [
+        { key: "de", kind: "direct", tag: "de-direct", cc: "DE" },
+        { key: "nl", kind: "direct", tag: "nl-direct", cc: "NL" },
+        { key: "fi", kind: "direct", tag: "fi-direct", cc: "FI" },
+      ],
+      profiles: [{ remark: "🔀 Авто", isAuto: true, primary: ["de"], fallback: ["nl"], reserve: ["fi"] }],
+    });
+    const sub = await activeSubscription();
+
+    const res = await service.deliverByShortUuid(sub.shortUuid, happ());
+    const [config] = parseConfigs(res);
+    const balancers = (config.routing as { balancers: Array<Record<string, unknown>> }).balancers;
+
+    assert.deepEqual(
+      balancers.map((b) => b.tag),
+      ["tier1", "tier2", "tier3"],
+    );
+    assert.equal(balancers[1].fallbackTag, "lo-out-2", "tier2 при отказе уходит в tier3");
+    assert.equal(balancers[2].fallbackTag, undefined);
+  });
+
   it("профиль, оставшийся без каналов, выбрасывается целиком", async () => {
     await seedNetwork(db, {
       channels: [

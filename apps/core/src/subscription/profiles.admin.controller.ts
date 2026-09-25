@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Inject, Param, Patch, Post, NotFoundException } from "@nestjs/common";
+import { BadRequestException, Body, Controller, Delete, Get, Inject, Param, Patch, Post, NotFoundException } from "@nestjs/common";
 import { and, eq } from "drizzle-orm";
 import { schema, type Database } from "@corelink/db";
 import { DB } from "../db/db.module.js";
@@ -92,12 +92,16 @@ export class ProfilesAdminController {
     return { ok: true };
   }
 
-  /** Привязка канала к профилю. tier 1 = основной, tier 2 = резерв (failover). */
+  /** Привязка канала к профилю. tier — эшелон: 1 основной, 2 резерв, 3 последний резерв. */
   @Post("profiles/:id/channels")
   async attachChannel(
     @Param("id") profileId: string,
     @Body() body: { channelId: string; tier?: number; sortOrder?: number },
   ) {
+    // выдача читает эшелоны 1..3 — канал с другим тиром молча выпал бы из подписки
+    if (body.tier !== undefined && ![1, 2, 3].includes(body.tier)) {
+      throw new BadRequestException("tier: допустимы 1, 2 или 3");
+    }
     const [row] = await this.db
       .insert(schema.profileChannel)
       .values({
