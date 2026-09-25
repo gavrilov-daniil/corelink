@@ -1,6 +1,6 @@
 import { BadRequestException, Inject, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { randomBytes, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, gte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, sql } from "drizzle-orm";
 import { schema, type Database } from "@corelink/db";
 import { DB } from "../db/db.module.js";
 import { loadConfig } from "../config.js";
@@ -233,6 +233,7 @@ export class SubscribersService {
     sortOrder?: number;
     squadIds?: string[];
   }) {
+    await this.assertPlanSquads(input.squadIds);
     const [row] = await this.db
       .insert(schema.plan)
       .values({
@@ -270,6 +271,7 @@ export class SubscribersService {
       if (value !== undefined) values[key] = value;
     }
     if (Object.keys(values).length === 0) throw new BadRequestException("нечего обновлять");
+    await this.assertPlanSquads(patch.squadIds);
 
     const [row] = await this.db
       .update(schema.plan)
@@ -278,6 +280,27 @@ export class SubscribersService {
       .returning();
     if (!row) throw new NotFoundException("тариф не найден");
     return row;
+  }
+
+  /**
+   * squad'ы тарифа существуют в org? Чужой id в тарифе ронял бы фулфилмент оплаты:
+   * вставка subscription_squad падает по FK внутри транзакции платежа — деньги
+   * приняты, дней нет.
+   */
+  private async assertPlanSquads(squadIds: string[] | undefined): Promise<void> {
+    if (squadIds === undefined) return;
+    if (!Array.isArray(squadIds)) throw new BadRequestException("squadIds: ожидается массив uuid");
+    if (squadIds.length === 0) return;
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const malformed = squadIds.filter((id) => typeof id !== "string" || !UUID_RE.test(id));
+    if (malformed.length > 0) throw new BadRequestException(`squadIds: не uuid — ${malformed.join(", ")}`);
+
+    const found = await this.db
+      .select({ id: schema.squad.id })
+      .from(schema.squad)
+      .where(and(eq(schema.squad.orgId, this.cfg.defaultOrgId), inArray(schema.squad.id, squadIds)));
+    const missing = squadIds.filter((id) => !found.some((f) => f.id === id));
+    if (missing.length > 0) throw new BadRequestException(`squadIds: не найдены ${missing.join(", ")}`);
   }
 
   /**

@@ -32,6 +32,7 @@ import {
   updateInbound,
   updateServer,
   updateSquad,
+  updateGeneralSquad,
   type ConfigProfile,
   type Host,
   type Inbound,
@@ -270,7 +271,16 @@ export default function InfraPage() {
   ];
 
   const squadColumns: Column<Squad>[] = [
-    { key: "name", title: "Squad", render: (s) => <span className="strong">{s.name}</span> },
+    {
+      key: "name",
+      title: "Squad",
+      render: (s) => (
+        <span className="strong">
+          {s.name}
+          {s.forAll && <span className="muted small"> · все клиенты</span>}
+        </span>
+      ),
+    },
     {
       key: "inbounds",
       title: "Inbound'ы",
@@ -334,9 +344,11 @@ export default function InfraPage() {
           nodes={nodes}
           servers={servers}
           inbounds={inbounds}
+          squads={squads}
           delivery={delivery}
           onAdd={() => setWizardOpen(true)}
           onReload={() => page.reload()}
+          onSaved={done(() => undefined)}
         />
       )}
 
@@ -1151,7 +1163,7 @@ function SquadModal({
       onClose={onClose}
       onSaved={onSaved}
       deleteHint="Удалить squad? Сработает, только если к нему не привязаны подписки и тарифы."
-      onDelete={row ? async () => (await deleteSquad(row.id)).rebuilt : undefined}
+      onDelete={row && !row.forAll ? async () => (await deleteSquad(row.id)).rebuilt : undefined}
       onSubmit={async () => {
         const body = { name: name.trim(), inboundIds: selected };
         if (row) return (await updateSquad(row.id, body)).rebuilt;
@@ -1197,22 +1209,29 @@ function SimpleInfra({
   nodes,
   servers,
   inbounds,
+  squads,
   delivery,
   onAdd,
   onReload,
+  onSaved,
 }: {
   nodes: Node[];
   servers: Server[];
   inbounds: Inbound[];
+  squads: Squad[];
   delivery: LocationDelivery[];
   onAdd: () => void;
   onReload: () => void;
+  onSaved: SavedHandler;
 }) {
   // первый inbound ноды: в простом режиме на ноду заводится ровно один
   const inboundByNode = new Map<string, Inbound>();
   for (const i of inbounds) if (i.nodeId && !inboundByNode.has(i.nodeId)) inboundByNode.set(i.nodeId, i);
   const deliveryByNode = new Map(delivery.map((d) => [d.nodeId, d]));
   const [deliveryTarget, setDeliveryTarget] = useState<Node | null>(null);
+  const [squadTarget, setSquadTarget] = useState<{ squad?: Squad; general: boolean } | null>(null);
+  const general = squads.find((s) => s.forAll);
+  const ownSquads = squads.filter((s) => !s.forAll);
 
   // серверы без ноды: в основную таблицу локаций не попадают, но почистить их надо где-то
   const orphanServers = servers.filter((s) => s.nodeCount === 0);
@@ -1272,6 +1291,11 @@ function SimpleInfra({
       render: (n) => <DeliveryCell node={n} state={deliveryByNode.get(n.id)} />,
     },
     {
+      key: "access",
+      title: "Доступ",
+      render: (n) => <AccessCell squads={squadsOfNode(n.id, squads, inbounds)} />,
+    },
+    {
       key: "actions",
       title: "",
       align: "right",
@@ -1307,6 +1331,10 @@ function SimpleInfra({
           <li>«Добавить локацию» → имя, IP, формат подключения, SSH-доступ и эшелон (tier).</li>
           <li>Сервер настраивается сам по SSH — вы только смотрите лог.</li>
           <li>Локация сразу попадает в подписку: в «🔀 Авто» и профиль своей страны (галочкой можно исключить).</li>
+          <li>
+            И сразу открыта всем клиентам через общий squad. Свой squad (например, «Премиум») открывает
+            локацию только клиентам тарифов, которые его выдают.
+          </li>
         </ol>
         <div className="row-actions">
           <button type="button" className="btn btn-primary" onClick={onAdd}>
@@ -1323,10 +1351,28 @@ function SimpleInfra({
         )}
       </Card>
 
+      <Card
+        title="Squad'ы: кому открыты локации"
+        subtitle="Клиент видит и получает локацию, только если её открывает его squad. Общий — у всех клиентов сразу, свои — по тарифу."
+        actions={
+          <button type="button" className="btn btn-primary" onClick={() => setSquadTarget({ general: false })}>
+            Создать squad
+          </button>
+        }
+      >
+        <SquadList
+          general={general}
+          own={ownSquads}
+          nodes={nodes}
+          inbounds={inbounds}
+          onEdit={(squad, isGeneral) => setSquadTarget({ squad, general: isGeneral })}
+        />
+      </Card>
+
       {orphanServers.length > 0 && (
         <Card title="Серверы без локации" subtitle="Заведены, но ноды на них нет — обычно остатки тестов.">
           {orphanServers.map((s) => (
-            <div key={s.id} className="orphan-row">
+            <div key={s.id} className="list-row">
               <span className="mono">
                 {s.hostname}
                 <span className="muted">
@@ -1359,14 +1405,185 @@ function SimpleInfra({
         <DeliveryModal
           node={deliveryTarget}
           state={deliveryByNode.get(deliveryTarget.id)}
+          general={general}
+          own={ownSquads}
+          current={squadsOfNode(deliveryTarget.id, squads, inbounds)}
           onClose={() => setDeliveryTarget(null)}
-          onSaved={() => {
+          onSaved={(rebuilt) => {
             setDeliveryTarget(null);
-            onReload();
+            onSaved(rebuilt);
+          }}
+        />
+      )}
+
+      {squadTarget && (
+        <SimpleSquadModal
+          squad={squadTarget.squad}
+          general={squadTarget.general}
+          nodes={nodes}
+          inbounds={inbounds}
+          onClose={() => setSquadTarget(null)}
+          onSaved={(rebuilt) => {
+            setSquadTarget(null);
+            onSaved(rebuilt);
           }}
         />
       )}
     </>
+  );
+}
+
+/** Squad'ы, открывающие локацию: те, в чьём составе есть её вход. */
+function squadsOfNode(nodeId: string, squads: Squad[], inbounds: Inbound[]): Squad[] {
+  const own = new Set(inbounds.filter((i) => i.nodeId === nodeId).map((i) => i.id));
+  return squads.filter((s) => s.inbounds.some((i) => own.has(i.id)));
+}
+
+/** Локации squad'а: ноды, чьи входы в его составе. */
+function nodesOfSquad(squad: Squad | undefined, nodes: Node[], inbounds: Inbound[]): Node[] {
+  if (!squad) return [];
+  const nodeIds = new Set(
+    inbounds.filter((i) => i.nodeId && squad.inbounds.some((si) => si.id === i.id)).map((i) => i.nodeId),
+  );
+  return nodes.filter((n) => nodeIds.has(n.id));
+}
+
+/** Кому открыта локация. Ни одного squad'а — клиенты её не видят и нода их не пустит. */
+function AccessCell({ squads }: { squads: Squad[] }) {
+  if (squads.length === 0) return <span className="warn small">никому</span>;
+  return <span className="small">{squads.map((s) => (s.forAll ? `${s.name} (все)` : s.name)).join(", ")}</span>;
+}
+
+/**
+ * Список squad'ов простого режима. Общий показываем всегда, даже если его ещё нет:
+ * он заводится при первой локации, а оператору важно видеть, что он предусмотрен.
+ */
+function SquadList({
+  general,
+  own,
+  nodes,
+  inbounds,
+  onEdit,
+}: {
+  general?: Squad;
+  own: Squad[];
+  nodes: Node[];
+  inbounds: Inbound[];
+  onEdit: (squad: Squad | undefined, isGeneral: boolean) => void;
+}) {
+  const locations = (s?: Squad) => {
+    const list = nodesOfSquad(s, nodes, inbounds);
+    return list.length === 0 ? <span className="muted">пока без локаций</span> : list.map((n) => n.name).join(", ");
+  };
+
+  return (
+    <div>
+      <div className="list-row">
+        <div>
+          <div className="strong">
+            {general?.name ?? "Общий"} <span className="badge badge-info">все клиенты</span>
+          </div>
+          <div className="small">{locations(general)}</div>
+        </div>
+        <button type="button" className="btn btn-sm" onClick={() => onEdit(general, true)}>
+          Изменить
+        </button>
+      </div>
+      {own.map((s) => (
+        <div key={s.id} className="list-row">
+          <div>
+            <div className="strong">{s.name}</div>
+            <div className="small">{locations(s)}</div>
+            <div className="muted small">
+              {s.plans.length > 0 ? (
+                `выдают тарифы: ${s.plans.map((p) => p.title).join(", ")}`
+              ) : (
+                <span className="warn">ни в одном тарифе — клиентам не выдаётся</span>
+              )}
+              {s.subscriptionCount > 0 && ` · подписок: ${s.subscriptionCount}`}
+            </div>
+          </div>
+          <button type="button" className="btn btn-sm" onClick={() => onEdit(s, false)}>
+            Изменить
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Squad в простом режиме: имя и локации галочками. Общий правится через отдельную
+ * ручку — до первой локации его нет, и id у формы нет.
+ */
+function SimpleSquadModal({
+  squad,
+  general,
+  nodes,
+  inbounds,
+  onClose,
+  onSaved,
+}: {
+  squad?: Squad;
+  general: boolean;
+  nodes: Node[];
+  inbounds: Inbound[];
+  onClose: () => void;
+  onSaved: SavedHandler;
+}) {
+  const [name, setName] = useState(squad?.name ?? (general ? "Общий" : ""));
+  const [selected, setSelected] = useState<string[]>(() => nodesOfSquad(squad, nodes, inbounds).map((n) => n.id));
+  const hasInbound = (nodeId: string) => inbounds.some((i) => i.nodeId === nodeId);
+
+  const toggle = (id: string, on: boolean) =>
+    setSelected((prev) => (on ? [...new Set([...prev, id])] : prev.filter((x) => x !== id)));
+
+  return (
+    <FormShell
+      title={general ? "Общий squad" : squad ? `Squad «${squad.name}»` : "Новый squad"}
+      editing={Boolean(squad) || general}
+      onClose={onClose}
+      onSaved={onSaved}
+      deleteHint="Удалить squad? Сработает, только если его не выдаёт ни один тариф и к нему не привязаны подписки."
+      onDelete={squad && !general ? async () => (await deleteSquad(squad.id)).rebuilt : undefined}
+      onSubmit={async () => {
+        const body = { name: name.trim(), nodeIds: selected };
+        if (general) return (await updateGeneralSquad(body)).rebuilt;
+        if (squad) return (await updateSquad(squad.id, body)).rebuilt;
+        return (await createSquad(body)).rebuilt;
+      }}
+    >
+      <Field label="Название" required>
+        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Премиум" />
+      </Field>
+
+      <h3 className="form-section">Локации</h3>
+      {nodes.length === 0 ? (
+        <p className="muted small">Локаций пока нет.</p>
+      ) : (
+        <div className="checks">
+          {nodes.map((n) => (
+            <label key={n.id} className="check">
+              <input
+                type="checkbox"
+                checked={selected.includes(n.id)}
+                disabled={!hasInbound(n.id)}
+                onChange={(e) => toggle(n.id, e.target.checked)}
+              />
+              <span>{n.name}</span>
+              <span className="muted small">
+                {[n.country, n.roles.join("/"), !hasInbound(n.id) && "нет входа"].filter(Boolean).join(" · ")}
+              </span>
+            </label>
+          ))}
+        </div>
+      )}
+      <p className="muted small">
+        {general
+          ? "Локации общего squad'а получают все клиенты, без тарифа. Новые локации мастер кладёт сюда сам."
+          : "Клиент получает эти локации, если squad выдаёт его тариф — отметьте squad в «Тарифах». Остальные клиенты их не увидят."}
+      </p>
+    </FormShell>
   );
 }
 
@@ -1400,31 +1617,47 @@ function DeliveryCell({ node, state }: { node: Node; state?: LocationDelivery })
   );
 }
 
-/** Правка выдачи: эшелон и членство в «Авто»/профиле страны. Снятая галочка — исключение. */
+/**
+ * Правка выдачи и доступа: эшелон, членство в «Авто»/профиле страны и squad'ы.
+ * Снятая галочка — исключение.
+ */
 function DeliveryModal({
   node,
   state,
+  general,
+  own,
+  current,
   onClose,
   onSaved,
 }: {
   node: Node;
   state?: LocationDelivery;
+  general?: Squad;
+  own: Squad[];
+  /** Squad'ы, которые открывают локацию сейчас. */
+  current: Squad[];
   onClose: () => void;
-  onSaved: () => void;
+  onSaved: SavedHandler;
 }) {
-  // у локации без канала (заведена до авто-выдачи) по умолчанию предлагаем выдавать везде
+  // у локации, заведённой до авто-выдачи и без squad'ов, по умолчанию предлагаем выдавать везде и всем
+  const untouched = !state?.wired && current.length === 0;
   const [tier, setTier] = useState(state?.tier ?? 1);
   const [inAuto, setInAuto] = useState(state?.wired ? state.inAuto : true);
   const [inCountry, setInCountry] = useState(state?.wired ? state.inCountry : true);
+  const [inGeneral, setInGeneral] = useState(untouched || current.some((s) => s.forAll));
+  const [squadIds, setSquadIds] = useState<string[]>(current.filter((s) => !s.forAll).map((s) => s.id));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const toggleSquad = (id: string, on: boolean) =>
+    setSquadIds((prev) => (on ? [...new Set([...prev, id])] : prev.filter((x) => x !== id)));
 
   const save = async () => {
     setBusy(true);
     setError(null);
     try {
-      await setLocationDelivery(node.serverId, { tier, inAuto, inCountry });
-      onSaved();
+      const res = await setLocationDelivery(node.serverId, { tier, inAuto, inCountry, inGeneral, squadIds });
+      onSaved(res.rebuilt);
     } catch (e) {
       setError(errorMessage(e));
       setBusy(false);
@@ -1470,6 +1703,30 @@ function DeliveryModal({
       <p className="muted small">
         Снятая галочка исключает локацию из профиля. Клиенты получат изменение при следующем обновлении подписки.
       </p>
+
+      <h3 className="form-section">Кому открыта</h3>
+      <div className="checks">
+        <label className="check">
+          <input type="checkbox" checked={inGeneral} onChange={(e) => setInGeneral(e.target.checked)} />
+          <span>«{general?.name ?? "Общий"}» — всем клиентам</span>
+        </label>
+        {own.map((s) => (
+          <label key={s.id} className="check">
+            <input
+              type="checkbox"
+              checked={squadIds.includes(s.id)}
+              onChange={(e) => toggleSquad(s.id, e.target.checked)}
+            />
+            <span>{s.name}</span>
+            <span className="muted small">
+              {s.plans.length > 0 ? `тарифы: ${s.plans.map((p) => p.title).join(", ")}` : "ни в одном тарифе"}
+            </span>
+          </label>
+        ))}
+      </div>
+      {!inGeneral && squadIds.length === 0 && (
+        <p className="warn small">Ни одного squad'а — локацию не увидит и не получит ни один клиент.</p>
+      )}
     </Modal>
   );
 }
@@ -1616,6 +1873,10 @@ function LocationWizard({
   const [tier, setTier] = useState(1);
   const [inAuto, setInAuto] = useState(true);
   const [inCountry, setInCountry] = useState(true);
+  // доступ: всем клиентам через общий squad (по умолчанию) и/или своим squad'ам тарифов
+  const [inGeneral, setInGeneral] = useState(true);
+  const general = squads.find((s) => s.forAll);
+  const ownSquads = squads.filter((s) => !s.forAll);
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1664,6 +1925,7 @@ function LocationWizard({
         roles,
         fingerprint,
         squadIds: selectedSquads,
+        inGeneral,
         tier,
         inAuto,
         inCountry,
@@ -1671,7 +1933,7 @@ function LocationWizard({
         ...sshBody(ssh),
       });
       setResult(res);
-      onProvisioned(describeProvision(res));
+      onProvisioned(describeProvision(res, sshConfigured));
     } catch (e) {
       setError(errorMessage(e));
       setBusy(false);
@@ -1696,9 +1958,11 @@ function LocationWizard({
           <li>{refLine("Вход (inbound)", result.inbound)}</li>
           <li>{refLine("Endpoint (host)", result.host)}</li>
         </ul>
-        {result.squads.length > 0 && (
-          <p className="small">Выдаётся в squad'ах: {result.squads.map((s) => s.name).join(", ")}.</p>
-        )}
+        <p className="small">
+          {result.squads.length > 0
+            ? `Открыта: ${result.squads.map((s) => (s.forAll ? `${s.name} (все клиенты)` : s.name)).join(", ")}.`
+            : "Не открыта ни одним squad'ом — клиенты её не получат, пока не откроете в «Выдаче»."}
+        </p>
         {result.delivery ? (
           <p className="small">
             {result.delivery.profiles.length > 0
@@ -1840,23 +2104,26 @@ function LocationWizard({
         </>
       )}
 
-      <h3 className="form-section">Выдавать в squad'ах</h3>
-      {squads.length === 0 ? (
-        <p className="muted small">Squad'ов пока нет — можно завести локацию сейчас и выдать её позже.</p>
-      ) : (
-        <div className="checks">
-          {squads.map((s) => (
-            <label key={s.id} className="check">
-              <input
-                type="checkbox"
-                checked={selectedSquads.includes(s.id)}
-                onChange={(e) => toggleSquad(s.id, e.target.checked)}
-              />
-              <span>{s.name}</span>
-            </label>
-          ))}
-        </div>
-      )}
+      <h3 className="form-section">Кому открыта</h3>
+      <div className="checks">
+        <label className="check">
+          <input type="checkbox" checked={inGeneral} onChange={(e) => setInGeneral(e.target.checked)} />
+          <span>«{general?.name ?? "Общий"}» — всем клиентам</span>
+        </label>
+        {ownSquads.map((s) => (
+          <label key={s.id} className="check">
+            <input
+              type="checkbox"
+              checked={selectedSquads.includes(s.id)}
+              onChange={(e) => toggleSquad(s.id, e.target.checked)}
+            />
+            <span>{s.name}</span>
+            <span className="muted small">
+              {s.plans.length > 0 ? `тарифы: ${s.plans.map((p) => p.title).join(", ")}` : "ни в одном тарифе"}
+            </span>
+          </label>
+        ))}
+      </div>
 
       <h3 className="form-section">SSH-доступ (для авто-настройки)</h3>
       <SshAccessFields value={ssh} onChange={(p) => setSsh((s) => ({ ...s, ...p }))} />
@@ -1895,7 +2162,7 @@ function refLine(label: string, ref: ProvisionResult["server"]): ReactNode {
   );
 }
 
-function describeProvision(res: ProvisionResult): string {
+function describeProvision(res: ProvisionResult, sshConfigured: boolean): string {
   const created = [
     res.server.created && "сервер",
     res.node.created && "нода",
@@ -1903,7 +2170,10 @@ function describeProvision(res: ProvisionResult): string {
     res.host.created && "endpoint",
   ].filter(Boolean);
   if (created.length === 0) return `Локация «${res.node.label}» уже была — состав не изменился.`;
-  return `Локация «${res.node.label}»: заведено — ${created.join(", ")}. Дальше выпустите токен агента.`;
+  const next = sshConfigured
+    ? "Сервер настраивается по SSH сам — лог в окне мастера."
+    : "Для авто-настройки задайте SSH-доступ сервера (продвинутый режим → «Серверы») и нажмите «Настроить».";
+  return `Локация «${res.node.label}»: заведено — ${created.join(", ")}. ${next}`;
 }
 
 

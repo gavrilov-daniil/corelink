@@ -1,5 +1,5 @@
 import { ConflictException, Inject, Injectable, Logger, NotFoundException } from "@nestjs/common";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { schema, type Database } from "@corelink/db";
 import { encryptCredentials } from "@corelink/core-kit";
 import { DB } from "../db/db.module.js";
@@ -14,6 +14,7 @@ import {
   type LocationDeliveryResult,
   type LocationDeliveryState,
 } from "./location-delivery.js";
+import { applyLocationAccess, ensureGeneralSquad, nodeInboundIds } from "./squad-access.js";
 import {
   FINGERPRINTS,
   INBOUND_FLOWS,
@@ -82,7 +83,8 @@ export interface ProvisionResult {
   node: ProvisionedRef;
   inbound: ProvisionedRef;
   host: ProvisionedRef;
-  squads: Array<{ id: string; name: string; attached: boolean }>;
+  /** Squad'ы, открывающие локацию клиентам, включая общий (forAll). */
+  squads: Array<{ id: string; name: string; forAll: boolean; attached: boolean }>;
   /** Куда локация попала в выдаче (null — не выходная нода, прямого канала нет). */
   delivery: LocationDeliveryResult | null;
   rebuilt: RebuildInfo[];
@@ -381,8 +383,9 @@ export class InfraService {
   }
 
   /**
-   * Правка выдачи локации: тир-эшелон и членство в «Авто»/профиле страны (снял галочку =
-   * исключил). Заодно подключает к выдаче локации, заведённые до авто-выдачи.
+   * Правка выдачи локации: тир-эшелон, членство в «Авто»/профиле страны и доступ через
+   * squad'ы (снял галочку = исключил). Заодно подключает к выдаче локации, заведённые
+   * до авто-выдачи. Доступ правится, только если он прислан (inGeneral / squadIds).
    */
   async setLocationDelivery(serverId: string, body: Raw) {
     requireUuid(serverId);
@@ -390,6 +393,9 @@ export class InfraService {
     const tier = num(body, "tier", { required: true, min: 1, max: 3 })!;
     const inAuto = bool(body, "inAuto") ?? true;
     const inCountry = bool(body, "inCountry") ?? true;
+    const inGeneral = bool(body, "inGeneral");
+    const squadIds = has(body, "squadIds") ? idList(body, "squadIds") : undefined;
+    if (squadIds) await this.assertSquadsExist(squadIds);
 
     const nodes = await this.db
       .select({ id: schema.node.id, roles: schema.node.roles })
@@ -406,8 +412,8 @@ export class InfraService {
       .limit(1);
     if (!host) bad("у ноды нет endpoint'а (host) — клиенту нечего выдать");
 
-    return this.db.transaction((tx) =>
-      applyLocationDelivery(tx, {
+    const delivery = await this.db.transaction(async (tx) => {
+      const result = await applyLocationDelivery(tx, {
         org: this.org,
         nodeId: exit.id,
         hostId: host.id,
@@ -415,8 +421,19 @@ export class InfraService {
         tier,
         inAuto,
         inCountry,
-      }),
-    );
+      });
+      await applyLocationAccess(tx, {
+        org: this.org,
+        inboundIds: await nodeInboundIds(tx, exit.id),
+        general: inGeneral,
+        squadIds,
+      });
+      return result;
+    });
+
+    // состав squad'ов — это список клиентов на ноде: пересборка после коммита
+    const accessTouched = inGeneral !== undefined || squadIds !== undefined;
+    return { ...delivery, rebuilt: accessTouched ? await this.rebuildNodes([exit.id]) : [] };
   }
 
   /** Состояние выдачи всех локаций — для строк простого режима. */
@@ -891,7 +908,8 @@ export class InfraService {
       .select()
       .from(schema.squad)
       .where(eq(schema.squad.orgId, this.org))
-      .orderBy(schema.squad.name);
+      // общий — первым: он у всех подписок, остальные — по имени
+      .orderBy(desc(schema.squad.forAll), asc(schema.squad.name));
     if (rows.length === 0) return [];
 
     const ids = rows.map((r) => r.id);
@@ -912,36 +930,44 @@ export class InfraService {
       .groupBy(schema.subscriptionSquad.squadId);
     const subCount = new Map(subs.map((s) => [s.squadId, s.n]));
 
+    // тарифы, выдающие squad: обычный squad доходит до клиента только через тариф
+    const plans = await this.db
+      .select({ code: schema.plan.code, title: schema.plan.title, squadIds: schema.plan.squadIds })
+      .from(schema.plan)
+      .where(eq(schema.plan.orgId, this.org))
+      .orderBy(schema.plan.sortOrder);
+
     return rows.map((s) => ({
       ...s,
       inbounds: links.filter((l) => l.squadId === s.id).map((l) => ({ id: l.inboundId, tag: l.tag })),
       subscriptionCount: subCount.get(s.id) ?? 0,
+      plans: plans.filter((p) => p.squadIds.includes(s.id)).map((p) => ({ code: p.code, title: p.title })),
     }));
   }
 
   async createSquad(body: Raw) {
     const name = str(body, "name", { required: true, max: 128 })!;
-    const inboundIds = await this.validateInboundIds(body);
+    const inboundIds = await this.squadComposition(null, body);
 
-    const [row] = await this.db.insert(schema.squad).values({ orgId: this.org, name }).returning();
+    const [row] = await this.db
+      .insert(schema.squad)
+      .values({ orgId: this.org, name })
+      .onConflictDoNothing({ target: [schema.squad.orgId, schema.squad.name] })
+      .returning();
+    if (!row) throw new ConflictException(`squad «${name}» уже есть`);
     const rebuilt = inboundIds ? await this.setSquadInbounds(row.id, inboundIds) : [];
     return { ...row, inboundIds: inboundIds ?? [], rebuilt };
   }
 
-  /** inboundIds — полная замена состава: одна форма правит набор целиком. */
+  /** Состав (inboundIds или nodeIds) — полная замена: одна форма правит набор целиком. */
   async updateSquad(id: string, body: Raw) {
     requireUuid(id);
     const name = str(body, "name", { max: 128 });
-    const inboundIds = await this.validateInboundIds(body);
+    const inboundIds = await this.squadComposition(id, body);
     if (name === undefined && inboundIds === undefined) bad("нечего обновлять");
 
     if (name !== undefined) {
-      const [row] = await this.db
-        .update(schema.squad)
-        .set({ name })
-        .where(and(eq(schema.squad.orgId, this.org), eq(schema.squad.id, id)))
-        .returning();
-      if (!row) throw new NotFoundException(`squad ${id} не найден`);
+      await this.renameSquad(id, name);
     } else {
       await this.assertSquadExists(id);
     }
@@ -951,8 +977,41 @@ export class InfraService {
     return { ...fresh, inboundIds: inboundIds ?? (await this.squadInboundIds(id)), rebuilt };
   }
 
+  /**
+   * Правка общего squad'а из простого режима. Отдельный вход, потому что до первой
+   * локации общего squad'а ещё нет и id у формы нет: заводим и правим как обычный.
+   */
+  async updateGeneralSquad(body: Raw) {
+    if (!has(body, "name") && !has(body, "inboundIds") && !has(body, "nodeIds")) bad("нечего обновлять");
+    const general = await this.db.transaction((tx) => ensureGeneralSquad(tx, this.org));
+    return this.updateSquad(general.id, body);
+  }
+
+  private async renameSquad(id: string, name: string): Promise<void> {
+    try {
+      const [row] = await this.db
+        .update(schema.squad)
+        .set({ name })
+        .where(and(eq(schema.squad.orgId, this.org), eq(schema.squad.id, id)))
+        .returning({ id: schema.squad.id });
+      if (!row) throw new NotFoundException(`squad ${id} не найден`);
+    } catch (err) {
+      if (isUniqueViolation(err)) throw new ConflictException(`squad «${name}» уже есть`);
+      throw err;
+    }
+  }
+
   async deleteSquad(id: string) {
     requireUuid(id);
+    const [target] = await this.db
+      .select({ forAll: schema.squad.forAll })
+      .from(schema.squad)
+      .where(and(eq(schema.squad.orgId, this.org), eq(schema.squad.id, id)))
+      .limit(1);
+    if (target?.forAll) {
+      throw new ConflictException("общий squad не удаляется — чтобы закрыть локацию, уберите её из него");
+    }
+
     const [subs] = await this.db
       .select({ n: sql<number>`count(*)::int` })
       .from(schema.subscriptionSquad)
@@ -979,6 +1038,44 @@ export class InfraService {
       if (!row) throw new NotFoundException(`squad ${id} не найден`);
     });
     return { ok: true, rebuilt: await this.rebuildNodes(affected) };
+  }
+
+  /**
+   * Состав squad'а из запроса: inboundIds (продвинутый режим) или nodeIds (простой —
+   * локациями). undefined — состав не присылали, не трогаем.
+   */
+  private async squadComposition(squadId: string | null, body: Raw): Promise<string[] | undefined> {
+    if (has(body, "inboundIds") && has(body, "nodeIds")) bad("состав squad'а — либо inboundIds, либо nodeIds");
+    if (has(body, "nodeIds")) return this.locationInboundIds(squadId, idList(body, "nodeIds"));
+    return this.validateInboundIds(body);
+  }
+
+  /**
+   * Входы выбранных локаций. Входы профилей без ноды простой режим не показывает —
+   * их сохраняем, иначе правка локациями молча сносила бы заведённое в продвинутом.
+   */
+  private async locationInboundIds(squadId: string | null, nodeIds: string[]): Promise<string[]> {
+    const ofNodes =
+      nodeIds.length === 0
+        ? []
+        : await this.db
+            .select({ id: schema.inbound.id, nodeId: schema.node.id })
+            .from(schema.inbound)
+            .innerJoin(schema.node, eq(schema.node.configProfileId, schema.inbound.configProfileId))
+            .where(and(eq(schema.node.orgId, this.org), inArray(schema.node.id, nodeIds)));
+    const missing = nodeIds.filter((id) => !ofNodes.some((r) => r.nodeId === id));
+    if (missing.length > 0) bad(`nodeIds: не найдены или без входа ${missing.join(", ")}`);
+
+    const kept =
+      squadId === null
+        ? []
+        : await this.db
+            .select({ id: schema.squadInbound.inboundId })
+            .from(schema.squadInbound)
+            .innerJoin(schema.inbound, eq(schema.inbound.id, schema.squadInbound.inboundId))
+            .leftJoin(schema.node, eq(schema.node.configProfileId, schema.inbound.configProfileId))
+            .where(and(eq(schema.squadInbound.squadId, squadId), isNull(schema.node.id)));
+    return [...new Set([...ofNodes, ...kept].map((r) => r.id))];
   }
 
   private async validateInboundIds(body: Raw): Promise<string[] | undefined> {
@@ -1045,7 +1142,7 @@ export class InfraService {
    */
   async provisionLocation(body: Raw): Promise<ProvisionResult> {
     const v = this.provisionValues(body);
-    const squads = await this.assertSquadsExist(v.squadIds);
+    const chosen = await this.assertSquadsExist(v.squadIds);
 
     const built = await this.db.transaction(async (tx) => {
       // сервер: ключ (org, hostname)
@@ -1120,6 +1217,9 @@ export class InfraService {
       if (!hostRow) throw new Error("provision: host не найден после конфликта");
 
       // squad'ы: ДОБАВЛЯЕМ inbound в набор (не заменяем — иначе снесли бы чужие).
+      // Общий — по умолчанию: без squad'а локацию не откроет ни одной подписке.
+      const general = v.inGeneral ? [{ ...(await ensureGeneralSquad(tx, this.org)), forAll: true }] : [];
+      const squads = [...new Map([...general, ...chosen].map((s) => [s.id, s])).values()];
       const attached: Record<string, boolean> = {};
       for (const s of squads) {
         const link = await tx
@@ -1149,7 +1249,7 @@ export class InfraService {
         node: { id: nodeRow.id, label: nodeRow.name, created: nodeCreated },
         inbound: { id: inboundRow.id, label: inboundRow.tag, created: inboundCreated },
         host: { id: hostRow.id, label: hostRow.remark, created: hostCreated },
-        attached,
+        squads: squads.map((s) => ({ id: s.id, name: s.name, forAll: s.forAll, attached: attached[s.id] ?? false })),
         delivery,
       };
     });
@@ -1163,7 +1263,7 @@ export class InfraService {
       node: built.node,
       inbound: built.inbound,
       host: built.host,
-      squads: squads.map((s) => ({ id: s.id, name: s.name, attached: built.attached[s.id] ?? false })),
+      squads: built.squads,
       delivery: built.delivery,
       rebuilt,
     };
@@ -1229,15 +1329,17 @@ export class InfraService {
       inbound,
       host,
       squadIds: idList(body, "squadIds"),
+      // доступ всем клиентам через общий squad — по умолчанию, как и выдача в «Авто»
+      inGeneral: bool(body, "inGeneral") ?? true,
       delivery,
     };
   }
 
   /** squad'ы для привязки существуют в этом org? Пустой список — норма (можно завести локацию без выдачи). */
-  private async assertSquadsExist(ids: string[]): Promise<Array<{ id: string; name: string }>> {
+  private async assertSquadsExist(ids: string[]): Promise<Array<{ id: string; name: string; forAll: boolean }>> {
     if (ids.length === 0) return [];
     const rows = await this.db
-      .select({ id: schema.squad.id, name: schema.squad.name })
+      .select({ id: schema.squad.id, name: schema.squad.name, forAll: schema.squad.forAll })
       .from(schema.squad)
       .where(and(eq(schema.squad.orgId, this.org), inArray(schema.squad.id, ids)));
     const missing = ids.filter((id) => !rows.some((r) => r.id === id));

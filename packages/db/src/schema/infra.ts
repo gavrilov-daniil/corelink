@@ -123,11 +123,14 @@ export const host = pgTable("host", {
 ]);
 
 // Internal squad = access-control (какие inbound'ы даёт).
+// for_all — общий squad: в нём состоит каждая подписка org, строк subscription_squad
+// для этого нет. Один на org — partial unique squad_org_for_all_uq в миграции 0020.
 export const squad = pgTable("squad", {
   id: uuid("id").primaryKey().defaultRandom(),
   orgId: orgId(),
   name: text("name").notNull(),
-});
+  forAll: boolean("for_all").notNull().default(false),
+}, (t) => [uniqueIndex("squad_org_name_uq").on(t.orgId, t.name)]);
 
 export const squadInbound = pgTable("squad_inbound", {
   squadId: uuid("squad_id").notNull().references(() => squad.id),

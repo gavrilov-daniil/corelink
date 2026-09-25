@@ -11,7 +11,15 @@ import { randomUUID } from "node:crypto";
 import { after, before, beforeEach, describe, it } from "node:test";
 import { eq } from "drizzle-orm";
 import { schema, type Database } from "@corelink/db";
-import { cleanupOrg, closeDb, createSubscriber, createSubscription, openDb, seedNetwork } from "../testing/fixtures.test.js";
+import {
+  cleanupOrg,
+  closeDb,
+  createSquad,
+  createSubscriber,
+  createSubscription,
+  openDb,
+  seedNetwork,
+} from "../testing/fixtures.test.js";
 import type { BotClient } from "../bot/bot.client.js";
 import { RateLimitService } from "../common/rate-limit.service.js";
 import { SubscriptionRepository } from "./subscription.repository.js";
@@ -278,6 +286,21 @@ describe("Выдача подписки: наша поломка = 503, а не 
     assert.equal(res.kind, "error");
   });
 
+  it("ни одна локация не открыта подписке squad'ами — 503 и алерт, а не пустой конфиг", async () => {
+    await seedNetwork(db, {
+      generalAccess: false,
+      channels: [{ key: "de", kind: "direct", tag: "de-direct", cc: "DE" }],
+      profiles: [{ remark: "🔀 Авто", isAuto: true, primary: ["de"] }],
+    });
+    const sub = await activeSubscription();
+
+    const res = await service.deliverByShortUuid(sub.shortUuid, happ());
+
+    assert.equal(res.status, 503, "активный клиент без единой локации — поломка настройки, а не его состояние");
+    assert.equal(res.kind, "error");
+    assert.ok(!res.body.includes("de-direct"));
+  });
+
   it("исключение генератора (каскад без front) — 503, а не 500 и не заглушка", async () => {
     await seedNetwork(db, {
       withFront: false,
@@ -371,6 +394,36 @@ describe("Выдача подписки: что попадает в конфиг
 
     assert.equal(res.kind, "happ");
     assert.deepEqual(remarks(res), ["🇵🇱 Польша"], "балансер с пустым селектором = клиент без интернета и без ошибки");
+  });
+
+  it("клиент видит только локации своих squad'ов: закрытой ноды в конфиге нет", async () => {
+    const net = await seedNetwork(db, {
+      channels: [
+        { key: "de", kind: "direct", tag: "de-direct", cc: "DE" },
+        { key: "jp", kind: "direct", tag: "jp-direct", cc: "JP", inbound: "VLESS_REALITY_PREMIUM" },
+      ],
+      profiles: [
+        { remark: "🔀 Авто", isAuto: true, primary: ["de", "jp"] },
+        { remark: "🇯🇵 Япония", primary: ["jp"] },
+      ],
+    });
+    const premium = await createSquad(db, "Премиум");
+    await db.insert(schema.squadInbound).values({
+      squadId: premium.id,
+      inboundId: net.inboundIdByTag.get("VLESS_REALITY_PREMIUM")!,
+    });
+    const basic = await activeSubscription();
+    const vip = await activeSubscription();
+    await db.insert(schema.subscriptionSquad).values({ subscriptionId: vip.id, squadId: premium.id });
+
+    const basicRes = await service.deliverByShortUuid(basic.shortUuid, happ());
+    assert.equal(basicRes.kind, "happ");
+    assert.deepEqual(remarks(basicRes), ["🔀 Авто"], "профиль из одних закрытых локаций выбрасывается целиком");
+    assert.ok(!basicRes.body.includes("jp-direct"), "нода не пустит — значит, и в конфиге её быть не должно");
+
+    const vipRes = await service.deliverByShortUuid(vip.shortUuid, happ());
+    assert.deepEqual(remarks(vipRes), ["🔀 Авто", "🇯🇵 Япония"]);
+    assert.ok(vipRes.body.includes("jp-direct"));
   });
 
   it("выключенный хост убирает свой канал из выдачи", async () => {

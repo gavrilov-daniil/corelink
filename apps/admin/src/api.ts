@@ -467,8 +467,13 @@ export interface Host {
 export interface Squad {
   id: string;
   name: string;
+  /** Общий squad: в нём каждая подписка автоматически, без тарифа. Один на org. */
+  forAll: boolean;
   inbounds: { id: string; tag: string }[];
+  /** Подписок с явным членством (у общего — обычно 0: членство подразумевается). */
   subscriptionCount: number;
+  /** Тарифы, которые выдают squad при оплате. */
+  plans: { code: string; title: string }[];
 }
 
 type WithRebuild<T> = T & { rebuilt: RebuildInfo[] };
@@ -563,12 +568,19 @@ export const deleteHost = (id: string) =>
 
 export const getSquads = () => request<Squad[]>("/api/admin/squads");
 
-export const createSquad = (body: { name: string; inboundIds?: string[] }) =>
+/** Состав: inboundIds (продвинутый режим) или nodeIds (простой — локациями), не оба сразу. */
+type SquadBody = { name?: string; inboundIds?: string[]; nodeIds?: string[] };
+
+export const createSquad = (body: SquadBody & { name: string }) =>
   request<WithRebuild<Squad>>("/api/admin/squads", post(body));
 
-/** inboundIds — полная замена состава, а не добавление. */
-export const updateSquad = (id: string, body: { name?: string; inboundIds?: string[] }) =>
+/** Состав — полная замена, а не добавление. */
+export const updateSquad = (id: string, body: SquadBody) =>
   request<WithRebuild<Squad>>(`/api/admin/squads/${id}`, patch(body));
+
+/** Общий squad: до первой локации его нет, поэтому правка без id — сервер заведёт его сам. */
+export const updateGeneralSquad = (body: SquadBody) =>
+  request<WithRebuild<Squad>>("/api/admin/squads/general", put(body));
 
 export const deleteSquad = (id: string) =>
   request<{ ok: boolean; rebuilt: RebuildInfo[] }>(`/api/admin/squads/${id}`, del());
@@ -592,7 +604,8 @@ export interface ProvisionResult {
   node: ProvisionedRef;
   inbound: ProvisionedRef;
   host: ProvisionedRef;
-  squads: { id: string; name: string; attached: boolean }[];
+  /** Squad'ы, открывающие локацию клиентам, включая общий (forAll). */
+  squads: { id: string; name: string; forAll: boolean; attached: boolean }[];
   /** Куда локация попала в выдаче; null — не выходная нода (relay/front). */
   delivery: { channelTag: string; tier: number; profiles: string[] } | null;
   rebuilt: RebuildInfo[];
@@ -613,8 +626,10 @@ export interface ProvisionInput {
   /** По умолчанию ["exit"]. */
   roles?: string[];
   fingerprint?: string;
-  /** В какие squad'ы добавить inbound (доступ подписок). */
+  /** В какие свои squad'ы добавить inbound (доступ подписок по тарифу). */
   squadIds?: string[];
+  /** Открыть локацию всем клиентам через общий squad (по умолчанию — да). */
+  inGeneral?: boolean;
   /** Формат подключения. reality (default) | tls | none (CDN терминирует TLS). */
   security?: string;
   /** tcp (default) | grpc | ws | xhttp. */
@@ -660,8 +675,15 @@ export interface LocationDelivery {
 
 export const getLocationDelivery = () => request<LocationDelivery[]>("/api/admin/infra/locations/delivery");
 
-export const setLocationDelivery = (serverId: string, body: { tier: number; inAuto: boolean; inCountry: boolean }) =>
-  request<{ channelTag: string; tier: number; profiles: string[] }>(
+/**
+ * Выдача и доступ локации. inGeneral / squadIds необязательны: без них squad'ы не трогаются.
+ * squadIds — полный набор своих squad'ов локации (снятая галочка убирает её из squad'а).
+ */
+export const setLocationDelivery = (
+  serverId: string,
+  body: { tier: number; inAuto: boolean; inCountry: boolean; inGeneral?: boolean; squadIds?: string[] },
+) =>
+  request<{ channelTag: string; tier: number; profiles: string[]; rebuilt: RebuildInfo[] }>(
     `/api/admin/infra/locations/${serverId}/delivery`,
     put(body),
   );

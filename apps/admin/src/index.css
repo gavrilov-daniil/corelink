@@ -241,14 +241,14 @@ a {
   flex-wrap: wrap;
 }
 
-.orphan-row {
+.list-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: var(--cl-space-2);
   padding: var(--cl-space-2) 0;
 }
-.orphan-row + .orphan-row {
+.list-row + .list-row {
   border-top: 1px solid var(--cl-border-subtle);
 }
 

@@ -9,10 +9,18 @@
 import "reflect-metadata";
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, it } from "node:test";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { schema, type Database } from "@corelink/db";
 import { isEncrypted } from "@corelink/core-kit";
-import { TEST_ORG_ID, cleanupOrg, closeDb, createSubscriber, createSubscription, openDb } from "../testing/fixtures.test.js";
+import {
+  TEST_ORG_ID,
+  cleanupOrg,
+  closeDb,
+  createPlan,
+  createSubscriber,
+  createSubscription,
+  openDb,
+} from "../testing/fixtures.test.js";
 import { NodeStateService } from "./node-state.service.js";
 import { InfraService } from "./infra.service.js";
 import { locationChannelTag } from "./location-delivery.js";
@@ -415,11 +423,13 @@ describe("мастер «Добавить локацию»", () => {
     const subscription = await createSubscription(db, subscriber.id);
     await db.insert(schema.subscriptionSquad).values({ subscriptionId: subscription.id, squadId: squad.id });
 
+    // без общего: иначе подписчик попал бы на ноду через него и привязку не проверили бы
     const result = await infra.provisionLocation({
       name: "de2-exit",
       primaryIp: "203.0.113.11",
       sni: "ads.x5.ru",
       squadIds: [squad.id],
+      inGeneral: false,
     });
 
     assert.equal(result.squads.length, 1);
@@ -680,5 +690,166 @@ describe("выдача локации клиентам (тир и профили
       inCountry: false,
       countryProfile: "🇩🇪 Германия",
     });
+  });
+});
+
+describe("доступ к локации: общий и свои squad'ы", () => {
+  const DAY_MS = 86_400_000;
+
+  const provision = (extra: Record<string, unknown> = {}) =>
+    infra.provisionLocation({
+      name: `loc-${Math.random().toString(36).slice(2, 8)}`,
+      primaryIp: "203.0.113.40",
+      sni: "ads.x5.ru",
+      country: "DE",
+      ...extra,
+    });
+
+  async function userUuids(nodeId: string): Promise<string[]> {
+    return (await state.getDesiredState(nodeId)).users.map((u) => u.uuid);
+  }
+
+  const generalSquads = () =>
+    db.select().from(schema.squad).where(and(eq(schema.squad.orgId, TEST_ORG_ID), eq(schema.squad.forAll, true)));
+
+  const squadLinks = (squadId: string) =>
+    db.select().from(schema.squadInbound).where(eq(schema.squadInbound.squadId, squadId));
+
+  it("мастер кладёт локацию в общий squad: её получают все активные подписки без строк subscription_squad", async () => {
+    const active = await createSubscription(db, (await createSubscriber(db)).id);
+    const expired = await createSubscription(db, (await createSubscriber(db)).id, {
+      expireAt: new Date(Date.now() - DAY_MS),
+    });
+
+    const res = await provision();
+
+    assert.deepEqual(
+      res.squads.map((s) => [s.name, s.forAll, s.attached]),
+      [["Общий", true, true]],
+    );
+    const users = await userUuids(res.node.id);
+    assert.ok(users.includes(active.vlessUuid), "общий squad пускает подписку без явного членства");
+    assert.ok(!users.includes(expired.vlessUuid), "истёкшая подписка на ноду не выгружается");
+    const memberships = await db
+      .select()
+      .from(schema.subscriptionSquad)
+      .where(eq(schema.subscriptionSquad.subscriptionId, active.id));
+    assert.equal(memberships.length, 0, "членство в общем подразумевается флагом, строк нет");
+  });
+
+  it("исключение: без галочки «Общий» локация закрыта для всех", async () => {
+    const sub = await createSubscription(db, (await createSubscriber(db)).id);
+    const res = await provision({ inGeneral: false });
+
+    assert.deepEqual(res.squads, []);
+    assert.equal((await userUuids(res.node.id)).includes(sub.vlessUuid), false);
+  });
+
+  it("общий squad в org один: второй мастер находит его, а не заводит новый", async () => {
+    await provision({ primaryIp: "203.0.113.41" });
+    await provision({ primaryIp: "203.0.113.42" });
+
+    const general = await generalSquads();
+    assert.equal(general.length, 1);
+    assert.equal((await squadLinks(general[0].id)).length, 2);
+  });
+
+  it("«Выдача»: снял общий и выбрал свой squad — на ноде остаются только его подписчики", async () => {
+    const res = await provision();
+    const premium = await infra.createSquad({ name: "Премиум" });
+    const basic = await createSubscription(db, (await createSubscriber(db)).id);
+    const vip = await createSubscription(db, (await createSubscriber(db)).id);
+    await db.insert(schema.subscriptionSquad).values({ subscriptionId: vip.id, squadId: premium.id });
+
+    const saved = await infra.setLocationDelivery(res.server.id, { tier: 1, inGeneral: false, squadIds: [premium.id] });
+    assert.equal(saved.rebuilt[0]?.changed, true, "состав squad'ов — это клиенты на ноде: версия обязана подняться");
+    const users = await userUuids(res.node.id);
+    assert.ok(users.includes(vip.vlessUuid));
+    assert.ok(!users.includes(basic.vlessUuid));
+
+    // и обратно: общий вернул, свой снял — снова все, а в «Премиум» локации больше нет
+    await infra.setLocationDelivery(res.server.id, { tier: 1, inGeneral: true, squadIds: [] });
+    const back = await userUuids(res.node.id);
+    assert.ok(back.includes(basic.vlessUuid) && back.includes(vip.vlessUuid));
+    assert.equal((await squadLinks(premium.id)).length, 0);
+  });
+
+  it("правка выдачи без полей доступа squad'ы не трогает и ноду не пересобирает", async () => {
+    const res = await provision();
+    const saved = await infra.setLocationDelivery(res.server.id, { tier: 2 });
+
+    assert.deepEqual(saved.rebuilt, []);
+    const [general] = await generalSquads();
+    assert.equal((await squadLinks(general.id)).length, 1);
+  });
+
+  it("squad собирается из локаций: nodeIds → входы нод, вход профиля без ноды сохраняется", async () => {
+    const res = await provision();
+    const orphanProfile = await profile();
+    const orphan = await infra.createInbound({
+      configProfileId: orphanProfile.id,
+      tag: "VLESS_REALITY_ORPHAN",
+      port: 443,
+      ...REALITY,
+    });
+    const squad = await infra.createSquad({ name: "Сборный", inboundIds: [orphan.id] });
+
+    const updated = await infra.updateSquad(squad.id, { nodeIds: [res.node.id] });
+    assert.deepEqual([...updated.inboundIds].sort(), [orphan.id, res.inbound.id].sort());
+
+    const cleared = await infra.updateSquad(squad.id, { nodeIds: [] });
+    assert.deepEqual(cleared.inboundIds, [orphan.id], "вход без ноды простой режим не показывает — и не сносит");
+  });
+
+  it("общий squad правится и до первой локации; повторно находится по флагу, а не по имени", async () => {
+    const n = await node();
+    await infra.createInbound({ configProfileId: n.configProfileId, tag: "VLESS_REALITY_GEN", port: 443, ...REALITY });
+
+    const general = await infra.updateGeneralSquad({ name: "Все клиенты", nodeIds: [n.id] });
+    assert.equal(general.forAll, true);
+    assert.equal(general.name, "Все клиенты");
+
+    const again = await infra.updateGeneralSquad({ nodeIds: [n.id] });
+    assert.equal(again.id, general.id);
+    assert.equal((await generalSquads()).length, 1);
+  });
+
+  it("общий squad не удаляется", async () => {
+    await provision();
+    const [general] = await generalSquads();
+    await assert.rejects(() => infra.deleteSquad(general.id), (e) => status(e) === 409);
+  });
+
+  it("имя squad'а уникально: дубль при создании и при переименовании — 409", async () => {
+    await infra.createSquad({ name: "Премиум" });
+    const other = await infra.createSquad({ name: "Базовый" });
+
+    await assert.rejects(() => infra.createSquad({ name: "Премиум" }), (e) => status(e) === 409);
+    await assert.rejects(() => infra.updateSquad(other.id, { name: "Премиум" }), (e) => status(e) === 409);
+  });
+
+  it("обычный squad с именем «Общий» не даёт завести общий — понятный 409, а не 500", async () => {
+    await infra.createSquad({ name: "Общий" });
+    await assert.rejects(
+      () => provision(),
+      (e) => status(e) === 409 && /переименуйте/.test((e as Error).message),
+    );
+  });
+
+  it("список: общий первым, у своих — тарифы, которые их выдают", async () => {
+    await provision();
+    const premium = await infra.createSquad({ name: "Премиум" });
+    await createPlan(db, { code: `year-${Math.random().toString(36).slice(2, 6)}`, squadIds: [premium.id] });
+
+    const list = await infra.listSquads();
+    assert.deepEqual(
+      list.map((s) => [s.name, s.forAll]),
+      [
+        ["Общий", true],
+        ["Премиум", false],
+      ],
+    );
+    assert.equal(list[1].plans.length, 1);
+    assert.equal(list[0].plans.length, 0);
   });
 });

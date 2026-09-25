@@ -1,5 +1,5 @@
 import { Inject, Injectable, Logger } from "@nestjs/common";
-import { and, asc, desc, eq, gte } from "drizzle-orm";
+import { and, asc, desc, eq, gte, isNotNull, or } from "drizzle-orm";
 import { schema, type Database } from "@corelink/db";
 import type { ChannelInput, DomainList, FrontOutbound, GeneratorInput, ProfileInput } from "@corelink/xray-config";
 import { DB } from "../db/db.module.js";
@@ -130,7 +130,12 @@ export class SubscriptionRepository {
     orgId: string,
     subscription: typeof schema.subscription.$inferSelect,
   ): Promise<SubscriptionBundle | null> {
-    const channels = await this.loadChannels(orgId);
+    const all = await this.loadChannels(orgId);
+    const open = await this.loadOpenInbounds(orgId, subscription.id);
+    const channels = all.filter((c) => open.has(c.inboundId)).map((c) => c.channel);
+    if (all.length > 0 && channels.length === 0) {
+      this.log.warn(`подписка ${subscription.shortUuid}: ни одна локация не открыта её squad'ами — проверьте общий squad`);
+    }
     const profiles = await this.loadProfiles(orgId, new Set(channels.map((c) => c.tag)));
     if (channels.length === 0 || profiles.length === 0) return null;
 
@@ -144,12 +149,39 @@ export class SubscriptionRepository {
   }
 
   /**
+   * Входы, открытые подписке: из общего squad'а (у всех) и из её собственных. Канал на
+   * закрытом входе клиенту не показываем: нода его не пустит, а в конфиге он выглядел
+   * бы рабочим — отдельный профиль страны из таких каналов был бы клиентом без интернета.
+   */
+  private async loadOpenInbounds(orgId: string, subscriptionId: string): Promise<Set<string>> {
+    const rows = await this.db
+      .selectDistinct({ inboundId: schema.squadInbound.inboundId })
+      .from(schema.squadInbound)
+      .innerJoin(schema.squad, eq(schema.squad.id, schema.squadInbound.squadId))
+      .leftJoin(
+        schema.subscriptionSquad,
+        and(
+          eq(schema.subscriptionSquad.squadId, schema.squad.id),
+          eq(schema.subscriptionSquad.subscriptionId, subscriptionId),
+        ),
+      )
+      .where(
+        and(
+          eq(schema.squad.orgId, orgId),
+          or(eq(schema.squad.forAll, true), isNotNull(schema.subscriptionSquad.subscriptionId)),
+        ),
+      );
+    return new Set(rows.map((r) => r.inboundId));
+  }
+
+  /**
    * Каналы, которые допустимо показывать клиенту прямо сейчас.
    * Отсекаем: хост без записи, выключенный/скрытый хост и каскад, у которого
    * не обе ноды применили конфиг (иначе балансер уведёт трафик в полу-собранную
    * цепочку — чёрную дыру без единого сообщения клиенту).
+   * inboundId — вход хоста: по нему решается, открыт ли канал этой подписке.
    */
-  private async loadChannels(orgId: string): Promise<ChannelInput[]> {
+  private async loadChannels(orgId: string): Promise<Array<{ inboundId: string; channel: ChannelInput }>> {
     const rows = await this.db
       .select({ ch: schema.channel, host: schema.host, link: schema.cascadeLink, inbound: schema.inbound })
       .from(schema.channel)
@@ -170,10 +202,13 @@ export class SubscriptionRepository {
       // канал без привязки к каскаду — обычный direct, его не отсекаем
       .filter((r) => !r.ch.cascadeLinkId || r.link?.status === "active")
       .map(({ ch, host, inbound }) => ({
-        kind: ch.kind as "direct" | "cascade",
-        tag: ch.newTag ?? ch.tag,
-        cc: ch.cc ?? undefined,
-        host: hostRef(host!, inbound),
+        inboundId: host!.inboundId,
+        channel: {
+          kind: ch.kind as "direct" | "cascade",
+          tag: ch.newTag ?? ch.tag,
+          cc: ch.cc ?? undefined,
+          host: hostRef(host!, inbound),
+        },
       }));
   }
 

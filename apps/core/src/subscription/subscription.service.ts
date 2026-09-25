@@ -91,7 +91,7 @@ export class SubscriptionService {
 
     try {
       const bundle = await this.repo.loadBundle(this.cfg.defaultOrgId, sub);
-      if (!bundle) return this.failure(sub.shortUuid, "каналы или профили не собрались");
+      if (!bundle) return this.failure(sub.shortUuid, "каналы или профили не собрались (выдача или доступ по squad'ам)");
 
       const rendered = projectVariants(bundle.input, bundle.profiles);
 

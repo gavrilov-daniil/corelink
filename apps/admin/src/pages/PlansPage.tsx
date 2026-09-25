@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { createPlan, errorMessage, getPlans, updatePlan, type Plan } from "../api";
+import { createPlan, errorMessage, getPlans, getSquads, updatePlan, type Plan, type Squad } from "../api";
 import { useResource } from "../useResource";
 import { formatKopeks } from "../format";
 import Card from "../components/Card";
@@ -14,6 +14,10 @@ import Loading from "../components/Loading";
 
 export default function PlansPage() {
   const plans = useResource(getPlans);
+  // squad'ы нужны только для подписей и выбора: не загрузились — тарифы всё равно правятся
+  const squads = useResource(getSquads);
+  const squadList = squads.data ?? [];
+  const squadName = (id: string) => squadList.find((s) => s.id === id)?.name ?? id.slice(0, 8);
   const [editing, setEditing] = useState<Plan | null>(null);
   const [creating, setCreating] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -60,7 +64,12 @@ export default function PlansPage() {
         <Toggle checked={p.isActive} disabled={busyId === p.id} onChange={(next) => toggleActive(p, next)} />
       ),
     },
-    { key: "squads", title: "Squad'ы", align: "right", render: (p) => p.squadIds.length },
+    {
+      key: "squads",
+      title: "Squad'ы",
+      render: (p) =>
+        p.squadIds.length === 0 ? <span className="muted">только общий</span> : p.squadIds.map(squadName).join(", "),
+    },
     { key: "sort", title: "Порядок", align: "right", render: (p) => p.sortOrder },
     {
       key: "actions",
@@ -106,6 +115,7 @@ export default function PlansPage() {
 
       {creating && (
         <PlanModal
+          squads={squadList}
           onClose={() => setCreating(false)}
           onSaved={() => {
             setCreating(false);
@@ -116,6 +126,7 @@ export default function PlansPage() {
       {editing && (
         <PlanModal
           plan={editing}
+          squads={squadList}
           onClose={() => setEditing(null)}
           onSaved={() => {
             setEditing(null);
@@ -135,7 +146,22 @@ function parseLimit(raw: string): number | null {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-function PlanModal({ plan, onClose, onSaved }: { plan?: Plan; onClose: () => void; onSaved: () => void }) {
+function PlanModal({
+  plan,
+  squads,
+  onClose,
+  onSaved,
+}: {
+  plan?: Plan;
+  squads: Squad[];
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  // выбор — только среди своих squad'ов: общий у всех подписок и так
+  const ownSquads = squads.filter((s) => !s.forAll);
+  const [squadIds, setSquadIds] = useState<string[]>(plan?.squadIds ?? []);
+  const toggleSquad = (id: string, on: boolean) =>
+    setSquadIds((prev) => (on ? [...new Set([...prev, id])] : prev.filter((x) => x !== id)));
   const [code, setCode] = useState(plan?.code ?? "");
   const [title, setTitle] = useState(plan?.title ?? "");
   const [periodDays, setPeriodDays] = useState(String(plan?.periodDays ?? 30));
@@ -184,6 +210,7 @@ function PlanModal({ plan, onClose, onSaved }: { plan?: Plan; onClose: () => voi
           isTrial,
           isActive,
           sortOrder: Number(sortOrder) || 0,
+          squadIds,
         });
       } else {
         await createPlan({
@@ -195,6 +222,7 @@ function PlanModal({ plan, onClose, onSaved }: { plan?: Plan; onClose: () => voi
           deviceLimit: parseLimit(deviceLimit) ?? undefined,
           isTrial,
           sortOrder: Number(sortOrder) || 0,
+          squadIds,
         });
       }
       onSaved();
@@ -257,6 +285,28 @@ function PlanModal({ plan, onClose, onSaved }: { plan?: Plan; onClose: () => voi
 
       <Field label="Пробный тариф" hint="выдаётся один раз на подписчика">
         <Toggle checked={isTrial} onChange={setIsTrial} label={isTrial ? "да" : "нет"} />
+      </Field>
+
+      <Field
+        label="Squad'ы тарифа"
+        hint="локации общего squad'а есть у всех; свой squad добавляет свои. Применяется при оплате и продлении"
+      >
+        {ownSquads.length === 0 ? (
+          <span className="muted small">Своих squad'ов нет — клиенты тарифа получат локации общего.</span>
+        ) : (
+          <div className="checks">
+            {ownSquads.map((s) => (
+              <label key={s.id} className="check">
+                <input
+                  type="checkbox"
+                  checked={squadIds.includes(s.id)}
+                  onChange={(e) => toggleSquad(s.id, e.target.checked)}
+                />
+                <span>{s.name}</span>
+              </label>
+            ))}
+          </div>
+        )}
       </Field>
 
       {plan ? (

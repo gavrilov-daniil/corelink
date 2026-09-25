@@ -141,6 +141,13 @@
       "when": 1785040140000,
       "tag": "0019_delivery_natural_keys",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1785040150000,
+      "tag": "0020_squad_for_all",
+      "breakpoints": true
     }
   ]
 }

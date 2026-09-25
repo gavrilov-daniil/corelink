@@ -33,7 +33,7 @@ export class InfraAdminController {
     return this.infra.deleteLocation(serverId);
   }
 
-  /** Выдача локаций клиентам: тир и членство в «Авто»/профиле страны. */
+  /** Выдача локаций клиентам: тир, членство в «Авто»/профиле страны и доступ через squad'ы. */
   @Get("infra/locations/delivery")
   listLocationDelivery() {
     return this.infra.listLocationDelivery();
@@ -186,6 +186,12 @@ export class InfraAdminController {
   @Post("squads")
   createSquad(@Body() body: Raw) {
     return this.infra.createSquad(body ?? {});
+  }
+
+  /** Общий squad (у всех подписок): заводится при первой правке, поэтому без id. */
+  @Put("squads/general")
+  updateGeneralSquad(@Body() body: Raw) {
+    return this.infra.updateGeneralSquad(body ?? {});
   }
 
   @Patch("squads/:id")

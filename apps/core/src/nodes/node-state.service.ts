@@ -1,5 +1,5 @@
 import { Inject, Injectable, Logger, NotFoundException } from "@nestjs/common";
-import { and, eq, inArray, ne, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import { schema, type Database } from "@corelink/db";
 import {
   buildNodeConfig,
@@ -215,8 +215,13 @@ export class NodeStateService {
     if (inboundIds.length === 0) return [];
 
     const squadLinks = await this.db
-      .select()
+      .select({
+        squadId: schema.squadInbound.squadId,
+        inboundId: schema.squadInbound.inboundId,
+        forAll: schema.squad.forAll,
+      })
       .from(schema.squadInbound)
+      .innerJoin(schema.squad, eq(schema.squad.id, schema.squadInbound.squadId))
       .where(inArray(schema.squadInbound.inboundId, inboundIds));
 
     const users: NodeUser[] = [];
@@ -231,6 +236,23 @@ export class NodeStateService {
         .from(schema.subscriptionSquad)
         .innerJoin(schema.subscription, eq(schema.subscriptionSquad.subscriptionId, schema.subscription.id))
         .where(inArray(schema.subscriptionSquad.squadId, squadIds));
+
+      // общий squad: в нём каждая подписка org, строк subscription_squad у него нет.
+      // Неактивных отсекаем ещё в SQL — их может быть больше, чем живых.
+      const generalIds = [...new Set(squadLinks.filter((s) => s.forAll).map((s) => s.squadId))];
+      if (generalIds.length > 0) {
+        const everyone = await this.db
+          .select()
+          .from(schema.subscription)
+          .where(
+            and(
+              eq(schema.subscription.orgId, node.orgId),
+              inArray(schema.subscription.status, ["active", "trial"]),
+              or(isNull(schema.subscription.expireAt), gte(schema.subscription.expireAt, new Date())),
+            ),
+          );
+        for (const sub of everyone) for (const squadId of generalIds) subs.push({ sub, squadId });
+      }
 
       const inboundById = new Map(inboundRows.map((i) => [i.id, i]));
       const inboundsBySquad = new Map<string, Array<typeof schema.inbound.$inferSelect>>();

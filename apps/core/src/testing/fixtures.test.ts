@@ -203,6 +203,8 @@ export interface ChannelSpec {
   cascadeStatus?: "planned" | "exit_ready" | "relay_ready" | "active" | "retiring";
   hostDisabled?: boolean;
   hostHidden?: boolean;
+  /** Тег отдельного входа под этот канал. Такой вход НЕ в общем squad'е — доступ к нему тест раздаёт сам. */
+  inbound?: string;
 }
 
 export interface ProfileSpec {
@@ -219,6 +221,11 @@ export interface NetworkSpec {
   profiles: ProfileSpec[];
   /** RU-front (host с tagPrefix "front"). Без него каскадный канал уронит генератор. */
   withFront?: boolean;
+  /**
+   * Общий squad с основным входом — как в проде, где мастер кладёт локацию в него.
+   * По умолчанию есть: без доступа выдача отфильтрует все каналы.
+   */
+  generalAccess?: boolean;
 }
 
 /** Сервер + нода + inbound + хосты + каналы + профили: минимальный полный вход генератора. */
@@ -249,6 +256,26 @@ export async function seedNetwork(db: Database, spec: NetworkSpec) {
     .values({ orgId: TEST_ORG_ID, configProfileId: configProfile.id, tag: "VLESS_REALITY_TEST", port: 443, ...reality })
     .returning();
 
+  if (spec.generalAccess !== false) {
+    const [general] = await db
+      .insert(schema.squad)
+      .values({ orgId: TEST_ORG_ID, name: "Общий", forAll: true })
+      .returning();
+    await db.insert(schema.squadInbound).values({ squadId: general.id, inboundId: inbound.id });
+  }
+
+  const inboundIdByTag = new Map<string, string>([[inbound.tag, inbound.id]]);
+  const inboundFor = async (tag: string | undefined): Promise<string> => {
+    const known = inboundIdByTag.get(tag ?? inbound.tag);
+    if (known) return known;
+    const [extra] = await db
+      .insert(schema.inbound)
+      .values({ orgId: TEST_ORG_ID, configProfileId: configProfile.id, tag: tag!, port: 443 + inboundIdByTag.size, ...reality })
+      .returning();
+    inboundIdByTag.set(extra.tag, extra.id);
+    return extra.id;
+  };
+
   if (spec.withFront !== false) {
     await db.insert(schema.host).values({
       orgId: TEST_ORG_ID,
@@ -272,7 +299,7 @@ export async function seedNetwork(db: Database, spec: NetworkSpec) {
       .insert(schema.host)
       .values({
         orgId: TEST_ORG_ID,
-        inboundId: inbound.id,
+        inboundId: await inboundFor(ch.inbound),
         nodeId: node.id,
         remark: ch.tag,
         address: `203.0.113.${octet}`,
@@ -358,7 +385,7 @@ export async function seedNetwork(db: Database, spec: NetworkSpec) {
     { listId: list.id, kind: "cidr", value: "77.88.0.0/18" },
   ]);
 
-  return { server, node, inbound, configProfile, channelIdByKey };
+  return { server, node, inbound, configProfile, channelIdByKey, inboundIdByTag };
 }
 
 /**
