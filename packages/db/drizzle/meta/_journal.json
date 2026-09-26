@@ -148,6 +148,13 @@
       "when": 1785040150000,
       "tag": "0020_squad_for_all",
       "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1785040160000,
+      "tag": "0021_node_xray_error",
+      "breakpoints": true
     }
   ]
 }

@@ -71,6 +71,10 @@ type ObservedState struct {
 	AgentVersion      string
 	XrayVersion       string
 	Sys               SysStats
+	// XrayError — почему Xray сейчас не обслуживает клиентов (не поднялся после
+	// рестарта, упал позже). Пусто — работает. Непустой отчёт control-plane не
+	// считает сходимостью, даже если хеш совпал.
+	XrayError string
 }
 
 // StatsDelta is one traffic delta in the control plane's format.
@@ -318,6 +322,7 @@ func (c *Client) ReportState(ctx context.Context, obs ObservedState) error {
 		AgentVersion:      obs.AgentVersion,
 		XrayVersion:       obs.XrayVersion,
 		SysStats:          obs.Sys,
+		XrayError:         obs.XrayError,
 	})
 	if err != nil {
 		return fmt.Errorf("controlplane: encode report: %w", err)
@@ -416,6 +421,7 @@ type reportRequest struct {
 	AgentVersion      string   `json:"agentVersion"`
 	XrayVersion       string   `json:"xrayVersion"`
 	SysStats          SysStats `json:"sysStats"`
+	XrayError         string   `json:"xrayError,omitempty"`
 }
 
 func (c *Client) nodePath(suffix string) string {

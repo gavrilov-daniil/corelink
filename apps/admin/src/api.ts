@@ -285,7 +285,9 @@ export interface Node {
   desiredVersion: number | null;
   desiredConfigHash: string | null;
   appliedConfigHash: string | null;
-  /** desired-хеш совпал с применённым агентом — только это значит «конфиг доехал». */
+  /** Почему Xray на ноде не обслуживает клиентов (со слов агента); null — работает. */
+  xrayError: string | null;
+  /** desired-хеш совпал с применённым агентом и Xray работает — только это значит «конфиг доехал». */
   converged: boolean;
 }
 

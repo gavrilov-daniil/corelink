@@ -55,6 +55,7 @@ export class AgentController {
       xrayVersion?: string;
       sysStats?: Record<string, unknown>;
       egressHealth?: Record<string, unknown>;
+      xrayError?: string;
     },
   ) {
     await this.identity.assertAgent(nodeId, token);

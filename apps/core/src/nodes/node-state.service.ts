@@ -169,12 +169,22 @@ export class NodeStateService {
    */
   async report(
     nodeId: string,
-    input: { appliedConfigHash?: string; agentVersion?: string; xrayVersion?: string; sysStats?: Record<string, unknown>; egressHealth?: Record<string, unknown> },
+    input: {
+      appliedConfigHash?: string;
+      agentVersion?: string;
+      xrayVersion?: string;
+      sysStats?: Record<string, unknown>;
+      egressHealth?: Record<string, unknown>;
+      /** Почему Xray не обслуживает клиентов; нет поля — работает. */
+      xrayError?: string;
+    },
   ) {
     const reported = {
       appliedConfigHash: input.appliedConfigHash,
       agentVersion: input.agentVersion,
       xrayVersion: input.xrayVersion,
+      // NULL, а не «не трогать»: следующий здоровый отчёт обязан снять прошлую ошибку
+      xrayError: typeof input.xrayError === "string" && input.xrayError.trim() ? input.xrayError.trim().slice(0, 2000) : null,
       sysStats: input.sysStats ?? {},
       egressHealth: input.egressHealth ?? {},
       heartbeatAt: new Date(),

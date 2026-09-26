@@ -174,6 +174,8 @@ export const nodeReportedState = pgTable("node_reported_state", {
   agentVersion: text("agent_version"),
   xrayVersion: text("xray_version"),
   appliedConfigHash: text("applied_config_hash"),
+  // почему Xray не обслуживает клиентов (со слов агента); NULL — работает
+  xrayError: text("xray_error"),
   sysStats: jsonb("sys_stats").$type<Record<string, unknown>>().notNull().default({}),
   egressHealth: jsonb("egress_health").$type<Record<string, unknown>>().notNull().default({}),
   heartbeatAt: timestamp("heartbeat_at", { withTimezone: true }),

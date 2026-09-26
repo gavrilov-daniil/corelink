@@ -85,9 +85,13 @@ func (r *Reconciler) reconcileOnce(ctx context.Context) error {
 		return fmt.Errorf("load applied state: %w", err)
 	}
 
+	// xrayProblem — почему Xray сейчас не обслуживает клиентов. Уходит в отчёт: по
+	// одному хешу control-plane считал бы сошедшейся ноду, где Xray лежит.
+	var xrayProblem error
 	// Hash idempotency: identical config_hash means nothing to do.
 	if desired.ConfigHash == applied.ConfigHash {
 		r.log.Debug("reconcile: config unchanged", "config_hash", desired.ConfigHash, "version", desired.Version)
+		xrayProblem = r.xray.Health(ctx)
 	} else {
 		r.log.Info("reconcile: applying new config",
 			"from_hash", applied.ConfigHash,
@@ -95,19 +99,23 @@ func (r *Reconciler) reconcileOnce(ctx context.Context) error {
 			"version", desired.Version,
 			"users", len(desired.Users))
 		if err := r.apply(ctx, desired); err != nil {
-			return fmt.Errorf("apply: %w", err)
-		}
-		applied = appliedState{
-			ConfigHash: desired.ConfigHash,
-			Version:    desired.Version,
-			AppliedAt:  time.Now().UTC(),
-		}
-		if err := r.saveAppliedState(applied); err != nil {
-			return fmt.Errorf("persist applied state: %w", err)
+			// Хеш НЕ сохраняем: следующий цикл применит заново (порт мог освободиться).
+			// Отчёт при этом уходит — с прежним хешем и причиной, иначе платформа видит
+			// только замолчавший heartbeat и не знает, что чинить.
+			xrayProblem = fmt.Errorf("apply: %w", err)
+		} else {
+			applied = appliedState{
+				ConfigHash: desired.ConfigHash,
+				Version:    desired.Version,
+				AppliedAt:  time.Now().UTC(),
+			}
+			if err := r.saveAppliedState(applied); err != nil {
+				return fmt.Errorf("persist applied state: %w", err)
+			}
 		}
 	}
 
-	if err := r.report(ctx, applied); err != nil {
+	if err := r.report(ctx, applied, xrayProblem); err != nil {
 		return fmt.Errorf("report: %w", err)
 	}
 	// Метрики не важнее конфига: не сняли статистику — жалуемся и идём дальше,
@@ -118,7 +126,7 @@ func (r *Reconciler) reconcileOnce(ctx context.Context) error {
 	if err := r.shipStats(ctx); err != nil {
 		return fmt.Errorf("ship stats: %w", err)
 	}
-	return nil
+	return xrayProblem
 }
 
 func (r *Reconciler) apply(ctx context.Context, ds *controlplane.DesiredState) error {
@@ -140,7 +148,7 @@ func (r *Reconciler) apply(ctx context.Context, ds *controlplane.DesiredState) e
 	if err := r.xray.Restart(ctx); err != nil {
 		return err
 	}
-	return nil
+	return r.xray.VerifyRunning(ctx, ds.Config)
 }
 
 // maxCountersPerEntry — потолок одной записи буфера, он же потолок одного тела
@@ -218,19 +226,23 @@ func nonZero(counters []stats.Counter) []stats.Counter {
 	return out
 }
 
-func (r *Reconciler) report(ctx context.Context, applied appliedState) error {
+func (r *Reconciler) report(ctx context.Context, applied appliedState, xrayProblem error) error {
 	xrayVer, err := r.xray.Version(ctx)
 	if err != nil {
 		r.log.Warn("reconcile: xray version unavailable", "err", err)
 		xrayVer = ""
 	}
 
-	return r.cp.ReportState(ctx, controlplane.ObservedState{
+	obs := controlplane.ObservedState{
 		AppliedConfigHash: applied.ConfigHash,
 		AgentVersion:      r.agentVersion,
 		XrayVersion:       xrayVer,
 		Sys:               collectSysStats(),
-	})
+	}
+	if xrayProblem != nil {
+		obs.XrayError = xrayProblem.Error()
+	}
+	return r.cp.ReportState(ctx, obs)
 }
 
 // shipStats ships the buffered stats batches one by one — each carries its own

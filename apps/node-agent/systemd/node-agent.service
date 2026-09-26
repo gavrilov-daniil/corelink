@@ -16,6 +16,10 @@ RestartSec=5
 # rule below. (DynamicUser=yes would work only if the agent ran as root.)
 User=node-agent
 Group=node-agent
+# Read access to the system journal: when Xray fails to start, the agent reports
+# the reason from `journalctl -u xray` (e.g. "bind: address already in use").
+# Without the group it only gets systemd's exit code.
+SupplementaryGroups=systemd-journal
 
 # StateDirectory creates and chowns /var/lib/node-agent for us (applied-state,
 # stats buffer, reality keypair live here).

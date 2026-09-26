@@ -128,7 +128,10 @@ export class CascadeService {
     return links.length;
   }
 
-  /** Нода сошлась, если применённый hash совпадает с желаемым. */
+  /**
+   * Нода сошлась, если применённый hash совпадает с желаемым и Xray на ней работает:
+   * иначе каскад через ноду с лежащим Xray раздавался бы клиентам как рабочий.
+   */
   private async isConverged(nodeId: string): Promise<boolean> {
     const [desired] = await this.db
       .select()
@@ -140,7 +143,7 @@ export class CascadeService {
       .from(schema.nodeReportedState)
       .where(eq(schema.nodeReportedState.nodeId, nodeId))
       .limit(1);
-    return Boolean(desired && reported && desired.configHash === reported.appliedConfigHash);
+    return Boolean(desired && reported && desired.configHash === reported.appliedConfigHash && !reported.xrayError);
   }
 
   /**

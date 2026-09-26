@@ -11,10 +11,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"vpn-platform/node-agent/internal/config"
 	"vpn-platform/node-agent/internal/stats"
@@ -23,6 +26,9 @@ import (
 // realityPrivateKeyPlaceholder — то, что control-plane кладёт в
 // realitySettings.privateKey вместо самого ключа.
 const realityPrivateKeyPlaceholder = "__REALITY_PRIVATE_KEY__"
+
+// maxProblemLen — потолок текста причины в отчёте: уходит в БД и в админку.
+const maxProblemLen = 1000
 
 // Manager drives Xray via systemd and reads its traffic counters over the local
 // gRPC API.
@@ -34,12 +40,56 @@ type Manager struct {
 	// statsClient == nil, когда адрес api-инбаунда не задан: тогда Stats честно
 	// возвращает ошибку, а не делает вид, что счётчиков нет.
 	statsClient *statsClient
+	hooks       Hooks
+}
+
+// Hooks — всё, чем менеджер трогает ОС вокруг Xray: команды (systemctl, journalctl,
+// xray) и TCP-проба портов. Отдельно — чтобы тест проверял логику проверки старта,
+// не запуская systemd. Нулевые поля заполняются боевыми значениями.
+type Hooks struct {
+	Run  func(ctx context.Context, name string, args ...string) ([]byte, error)
+	Dial func(ctx context.Context, addr string) error
+	// StartupTimeout — сколько ждать выхода в active после рестарта; StableFor —
+	// сколько он обязан продержаться подряд; PollEvery — шаг опроса.
+	StartupTimeout time.Duration
+	StableFor      time.Duration
+	PollEvery      time.Duration
 }
 
 // NewManager. apiAddr — адрес api-инбаунда Xray ("127.0.0.1:10085" в конфиге,
 // который собирает control-plane). Пустой адрес отключает чтение статистики.
 func NewManager(systemdUnit, realityPrivateKeyPath, apiAddr string) *Manager {
-	m := &Manager{systemdUnit: systemdUnit, realityPrivateKeyPath: realityPrivateKeyPath}
+	return NewManagerWithHooks(systemdUnit, realityPrivateKeyPath, apiAddr, Hooks{})
+}
+
+func NewManagerWithHooks(systemdUnit, realityPrivateKeyPath, apiAddr string, hooks Hooks) *Manager {
+	if hooks.Run == nil {
+		hooks.Run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			return exec.CommandContext(ctx, name, args...).CombinedOutput()
+		}
+	}
+	if hooks.Dial == nil {
+		hooks.Dial = func(ctx context.Context, addr string) error {
+			d := net.Dialer{Timeout: 2 * time.Second}
+			conn, err := d.DialContext(ctx, "tcp", addr)
+			if err != nil {
+				return err
+			}
+			return conn.Close()
+		}
+	}
+	// 20 с — как у провижна для агента: крэш-цикл systemd (RestartSec 100 мс,
+	// StartLimitBurst 5) за это время гарантированно упирается в failed.
+	if hooks.StartupTimeout == 0 {
+		hooks.StartupTimeout = 20 * time.Second
+	}
+	if hooks.StableFor == 0 {
+		hooks.StableFor = 3 * time.Second
+	}
+	if hooks.PollEvery == 0 {
+		hooks.PollEvery = time.Second
+	}
+	m := &Manager{systemdUnit: systemdUnit, realityPrivateKeyPath: realityPrivateKeyPath, hooks: hooks}
 	if apiAddr != "" {
 		m.statsClient = newStatsClient(apiAddr)
 	}
@@ -127,18 +177,167 @@ func (m *Manager) Reload(ctx context.Context) error { return m.systemctl(ctx, "r
 func (m *Manager) Restart(ctx context.Context) error { return m.systemctl(ctx, "restart") }
 
 func (m *Manager) systemctl(ctx context.Context, verb string) error {
-	cmd := exec.CommandContext(ctx, "systemctl", verb, m.systemdUnit)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("xray: systemctl %s %s: %w: %s", verb, m.systemdUnit, err, strings.TrimSpace(stderr.String()))
+	out, err := m.hooks.Run(ctx, "systemctl", verb, m.systemdUnit)
+	if err != nil {
+		return fmt.Errorf("xray: systemctl %s %s: %w: %s", verb, m.systemdUnit, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
 
+// VerifyRunning проверяет, что Xray после рестарта реально работает, а не крутится в
+// крэш-цикле systemd. `systemctl restart` успешен, как только процесс запущен
+// (Type=simple): Xray, упавший через миллисекунды на bind чужого порта, всё равно
+// «перезапущен», и без этой проверки агент рапортовал бы конфиг применённым, а
+// админка показывала бы мёртвую ноду рабочей.
+//
+// Успех — unit держит active подряд дольше StableFor (крэш-цикл перебирает
+// active/activating и упирается в failed) и порты inbound'ов конфига принимают TCP.
+// Проба порта сама по себе не доказательство — порт мог держать чужой процесс, —
+// поэтому она идёт только после стабильного active: упавший на bind Xray до неё не
+// доживает.
+func (m *Manager) VerifyRunning(ctx context.Context, cfg []byte) error {
+	if err := m.waitStableActive(ctx); err != nil {
+		return err
+	}
+	for _, addr := range inboundAddrs(cfg) {
+		if err := m.hooks.Dial(ctx, addr); err != nil {
+			return fmt.Errorf("xray запущен, но вход %s не принимает соединения: %v", addr, err)
+		}
+	}
+	return nil
+}
+
+// Health — быстрая проверка между применениями конфига: Xray мог упасть позже
+// (OOM, после ребута порт первым занял чужой сервис). Не active — та же
+// диагностика, что и при старте.
+func (m *Manager) Health(ctx context.Context) error {
+	if state := m.activeState(ctx); state != "active" {
+		return m.notRunning(ctx, state)
+	}
+	return nil
+}
+
+func (m *Manager) waitStableActive(ctx context.Context) error {
+	deadline := time.Now().Add(m.hooks.StartupTimeout)
+	var activeSince time.Time
+	for {
+		state := m.activeState(ctx)
+		switch state {
+		case "active":
+			if activeSince.IsZero() {
+				activeSince = time.Now()
+			}
+			if time.Since(activeSince) >= m.hooks.StableFor {
+				return nil
+			}
+		case "failed":
+			return m.notRunning(ctx, state)
+		default:
+			activeSince = time.Time{}
+		}
+		if time.Now().After(deadline) {
+			return m.notRunning(ctx, state)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(m.hooks.PollEvery):
+		}
+	}
+}
+
+// activeState — ответ `systemctl is-active`: при неактивном unit'е команда выходит с
+// ненулевым кодом, поэтому смотрим на вывод, а не на ошибку.
+func (m *Manager) activeState(ctx context.Context) string {
+	out, _ := m.hooks.Run(ctx, "systemctl", "is-active", m.systemdUnit)
+	if s := strings.TrimSpace(string(out)); s != "" {
+		return s
+	}
+	return "unknown"
+}
+
+func (m *Manager) notRunning(ctx context.Context, state string) error {
+	msg := fmt.Sprintf("xray не работает (%s): %s", state, m.diagnose(ctx))
+	if len(msg) > maxProblemLen {
+		msg = msg[:maxProblemLen]
+	}
+	return errors.New(msg)
+}
+
+// diagnose — почему Xray не работает, для оператора в админке. Журнал unit'а точнее
+// всего («bind: address already in use»); если агенту он закрыт (нет группы
+// systemd-journal у пользователя node-agent), берём итог systemd: результат, код
+// выхода и число рестартов.
+func (m *Manager) diagnose(ctx context.Context) string {
+	journal, _ := m.hooks.Run(ctx, "journalctl", "-u", m.systemdUnit, "-n", "40", "--no-pager", "-o", "cat")
+	if lines := problemLines(string(journal)); len(lines) > 0 {
+		return strings.Join(lines, " | ")
+	}
+	show, _ := m.hooks.Run(ctx, "systemctl", "show", m.systemdUnit, "-p", "Result", "-p", "ExecMainStatus", "-p", "NRestarts")
+	if summary := strings.Join(strings.Fields(string(show)), ", "); summary != "" {
+		return "журнал недоступен, systemd: " + summary
+	}
+	return "журнал и статус systemd недоступны"
+}
+
+// problemLines — последние строки журнала с признаками падения, без повторов: в
+// крэш-цикле одни и те же строки идут по кругу. Строки доступа Xray (адреса
+// клиентов) сюда не попадают — наружу уходит только причина.
+func problemLines(journal string) []string {
+	var found []string
+	seen := map[string]bool{}
+	for _, line := range strings.Split(journal, "\n") {
+		line = strings.TrimSpace(line)
+		lower := strings.ToLower(line)
+		if line == "" || seen[line] {
+			continue
+		}
+		if strings.Contains(lower, "fail") || strings.Contains(lower, "error") ||
+			strings.Contains(lower, "panic") || strings.Contains(lower, "exited") {
+			seen[line] = true
+			found = append(found, line)
+		}
+	}
+	if len(found) > 3 {
+		found = found[len(found)-3:]
+	}
+	return found
+}
+
+// inboundAddrs — куда стучаться, проверяя порты inbound'ов конфига. Слушающий все
+// адреса inbound проверяем через loopback; нечисловой порт (диапазон) и unix-сокет
+// пропускаем — их простым dial'ом не проверить.
+func inboundAddrs(cfg []byte) []string {
+	var parsed struct {
+		Inbounds []struct {
+			Listen string          `json:"listen"`
+			Port   json.RawMessage `json:"port"`
+		} `json:"inbounds"`
+	}
+	if json.Unmarshal(cfg, &parsed) != nil {
+		return nil
+	}
+	var addrs []string
+	for _, ib := range parsed.Inbounds {
+		port, err := strconv.Atoi(strings.TrimSpace(string(ib.Port)))
+		if err != nil || port <= 0 {
+			continue
+		}
+		host := ib.Listen
+		switch {
+		case host == "" || host == "0.0.0.0" || host == "::":
+			host = "127.0.0.1"
+		case strings.HasPrefix(host, "/") || strings.HasPrefix(host, "@"):
+			continue
+		}
+		addrs = append(addrs, net.JoinHostPort(host, strconv.Itoa(port)))
+	}
+	return addrs
+}
+
 // Version returns the first line of `xray version`.
 func (m *Manager) Version(ctx context.Context) (string, error) {
-	out, err := exec.CommandContext(ctx, "xray", "version").Output()
+	out, err := m.hooks.Run(ctx, "xray", "version")
 	if err != nil {
 		return "", fmt.Errorf("xray: version: %w", err)
 	}

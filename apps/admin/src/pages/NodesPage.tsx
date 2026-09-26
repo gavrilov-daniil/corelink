@@ -119,13 +119,18 @@ export default function NodesPage() {
       title: "Конфиг",
       render: (n) => (
         <div>
-          <StatusBadge
-            status={n.converged ? "ok" : "pending"}
-            label={n.converged ? `сошёлся, v${n.desiredVersion ?? 0}` : `не сошёлся, v${n.desiredVersion ?? 0}`}
-          />
+          {n.xrayError ? (
+            <StatusBadge status="error" label="Xray не работает" />
+          ) : (
+            <StatusBadge
+              status={n.converged ? "ok" : "pending"}
+              label={n.converged ? `сошёлся, v${n.desiredVersion ?? 0}` : `не сошёлся, v${n.desiredVersion ?? 0}`}
+            />
+          )}
           <div className="muted small mono">
             {shortHash(n.desiredConfigHash)} → {shortHash(n.appliedConfigHash)}
           </div>
+          {n.xrayError && <div className="err small">{n.xrayError}</div>}
         </div>
       ),
     },

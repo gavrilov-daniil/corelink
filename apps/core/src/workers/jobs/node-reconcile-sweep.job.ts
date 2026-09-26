@@ -53,6 +53,9 @@ export class NodeReconcileSweepJob implements JobRunner {
       if (row.desired && row.desired.configHash !== row.reported?.appliedConfigHash) {
         reasons.push("config_drift");
       }
+      if (row.reported?.xrayError) {
+        reasons.push("xray_down");
+      }
       const heartbeatAt = row.reported?.heartbeatAt ?? null;
       if (!heartbeatAt || now - heartbeatAt.getTime() > HEARTBEAT_STALE_MS) {
         reasons.push("stale_heartbeat");
@@ -63,7 +66,14 @@ export class NodeReconcileSweepJob implements JobRunner {
       this.log.warn(`node ${row.node.name} (${row.node.id}): ${reasons.join(", ")}`);
       await this.alerts.alertOnce(
         `node_reconcile:${row.node.id}:${bucket}`,
-        alertText(row.node.name, reasons, row.desired?.configHash ?? null, row.reported?.appliedConfigHash ?? null, heartbeatAt),
+        alertText(
+          row.node.name,
+          reasons,
+          row.desired?.configHash ?? null,
+          row.reported?.appliedConfigHash ?? null,
+          heartbeatAt,
+          row.reported?.xrayError ?? null,
+        ),
       );
     }
 
@@ -91,10 +101,14 @@ function alertText(
   desiredHash: string | null,
   appliedHash: string | null,
   heartbeatAt: Date | null,
+  xrayError: string | null,
 ): string {
   const lines = [`⚠️ Нода <b>${name}</b> разъехалась: ${reasons.join(", ")}`];
   if (reasons.includes("config_drift")) {
     lines.push(`desired: ${short(desiredHash)} / applied: ${short(appliedHash)}`);
+  }
+  if (xrayError) {
+    lines.push(`xray: ${escapeHtml(xrayError.slice(0, 300))}`);
   }
   if (reasons.includes("stale_heartbeat")) {
     lines.push(`heartbeat: ${heartbeatAt ? heartbeatAt.toISOString() : "никогда"}`);
@@ -104,4 +118,10 @@ function alertText(
 
 function short(hash: string | null): string {
   return hash ? hash.slice(0, 12) : "—";
+}
+
+// Алерт уходит в Telegram с parse_mode=HTML, а в ошибках Xray есть «>» — без
+// экранирования Telegram отверг бы сообщение целиком.
+function escapeHtml(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }

@@ -51,7 +51,11 @@ export class AdminController {
       desiredVersion: desired?.version ?? null,
       desiredConfigHash: desired?.configHash ?? null,
       appliedConfigHash: reported?.appliedConfigHash ?? null,
-      converged: Boolean(desired && reported && desired.configHash === reported.appliedConfigHash),
+      // хеш совпал, а Xray лежит — это не сходимость: клиентов нода не обслуживает
+      xrayError: reported?.xrayError ?? null,
+      converged: Boolean(
+        desired && reported && desired.configHash === reported.appliedConfigHash && !reported.xrayError,
+      ),
     }));
   }
 

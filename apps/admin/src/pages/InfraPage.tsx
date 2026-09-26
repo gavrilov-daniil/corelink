@@ -1288,7 +1288,16 @@ function SimpleInfra({
       title: "Состояние",
       render: (n) => {
         const s = locationState(n, inboundByNode.get(n.id));
-        return <StatusBadge status="loc" tone={s.tone} label={s.label} />;
+        return (
+          <div>
+            <StatusBadge status="loc" tone={s.tone} label={s.label} />
+            {n.xrayError && (
+              <div className="err small" title={n.xrayError}>
+                {n.xrayError.length > 160 ? `${n.xrayError.slice(0, 160)}…` : n.xrayError}
+              </div>
+            )}
+          </div>
+        );
       },
     },
     {
@@ -1743,8 +1752,10 @@ function DeliveryModal({
 }
 
 /** Состояние локации в терминах оператора, без деталей про хеши конфига. */
-function locationState(n: Node, inbound?: Inbound): { tone: "ok" | "warn" | "muted"; label: string } {
+function locationState(n: Node, inbound?: Inbound): { tone: "ok" | "warn" | "err" | "muted"; label: string } {
   if (!inbound) return { tone: "muted", label: "нет входа" };
+  // агент на связи, а Xray лежит: хеш мог и совпасть — клиентов нода всё равно не обслуживает
+  if (n.xrayError) return { tone: "err", label: "Xray не работает" };
   // pbk пустой или нет ни одного heartbeat — агента ещё не поставили/не энроллили
   if (!inbound.realityPublicKey || !n.lastHeartbeatAt) return { tone: "warn", label: "ждёт агента" };
   if (n.converged) return { tone: "ok", label: `работает, v${n.desiredVersion ?? 0}` };
