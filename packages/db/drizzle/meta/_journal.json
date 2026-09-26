@@ -155,6 +155,13 @@
       "when": 1785040160000,
       "tag": "0021_node_xray_error",
       "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1785040170000,
+      "tag": "0022_monitoring",
+      "breakpoints": true
     }
   ]
 }

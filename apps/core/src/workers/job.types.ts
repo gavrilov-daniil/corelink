@@ -11,6 +11,7 @@ export const JOB_NAMES = [
   "ai-suggest",
   "maintenance",
   "provision-resume",
+  "node-probe",
 ] as const;
 
 export type JobName = (typeof JOB_NAMES)[number];

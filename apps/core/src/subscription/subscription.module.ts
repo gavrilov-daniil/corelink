@@ -12,5 +12,7 @@ import { SubscriptionRepository } from "./subscription.repository.js";
   // RateLimitService держит своё соединение с Redis: у очереди BullMQ настройки
   // соединения другие (бесконечные ретраи блокирующих команд), и делить их нельзя.
   providers: [SubscriptionService, SubscriptionRepository, RateLimitService],
+  // репозиторий нужен мониторингу: проба берёт каналы тем же путём, что и выдача
+  exports: [SubscriptionRepository],
 })
 export class SubscriptionModule {}

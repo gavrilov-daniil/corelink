@@ -406,6 +406,10 @@ export async function cleanupOrg(db: Database): Promise<void> {
     sql`delete from plan where org_id = ${org}`,
     sql`delete from campaign_link where org_id = ${org}`,
     sql`delete from campaign where org_id = ${org}`,
+    // мониторинг ссылается на служебную подписку пробы — до подписок
+    sql`delete from monitor_event where org_id = ${org}`,
+    sql`delete from probe_result where org_id = ${org}`,
+    sql`delete from monitor_probe where org_id = ${org}`,
     sql`delete from subscriber_device where org_id = ${org}`,
     sql`delete from subscription_squad where subscription_id in (select id from subscription where org_id = ${org})`,
     sql`delete from squad_inbound where squad_id in (select id from squad where org_id = ${org})`,

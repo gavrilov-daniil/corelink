@@ -17,6 +17,7 @@ import { SubscribersModule } from "./subscribers/subscribers.module.js";
 import { ImportModule } from "./import/import.module.js";
 import { AuthModule } from "./auth/auth.module.js";
 import { WorkersModule } from "./workers/workers.module.js";
+import { MonitoringModule } from "./monitoring/monitoring.module.js";
 
 @Controller()
 class HealthController {
@@ -44,6 +45,7 @@ class HealthController {
     CrmModule,
     BroadcastModule,
     WorkersModule,
+    MonitoringModule,
   ],
   controllers: [HealthController],
   // Гварды на разные префиксы: /internal/* — сервисный токен, /api/admin/* — админский.

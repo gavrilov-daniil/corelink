@@ -215,6 +215,48 @@ export function projectVariants(input: GeneratorInput, profiles: ProfileInput[])
   return profiles.map((p) => ({ remark: p.remark, config: buildProfileConfig(input, p) }));
 }
 
+export interface ProbeTarget {
+  /** Тег канала — тот же, что в подписке. */
+  tag: string;
+  /** Локальный SOCKS-порт, через который идёт проверка этого канала. */
+  port: number;
+}
+
+/**
+ * Конфиг синтетической пробы: по SOCKS-входу на каждый канал, каждый вход ведёт прямо в
+ * свой outbound. Outbound'ы собирает тот же channelOutbound, что и клиентский конфиг, —
+ * проба проверяет ровно то, что получает клиент, а не свою копию настроек. Каскадному
+ * каналу нужен front — кладём его так же, как в подписке.
+ */
+export function buildProbeConfig(
+  input: GeneratorInput,
+  basePort: number,
+): { config: XrayConfig; targets: ProbeTarget[] } {
+  const targets = input.channels.map((ch, i) => ({ tag: ch.tag, port: basePort + i }));
+  const outbounds = input.channels.map((ch) => channelOutbound(ch, input));
+  if (input.front && input.channels.some((ch) => ch.kind === "cascade")) {
+    outbounds.push(frontOutbound(input.front, input.vlessUuid));
+  }
+  return {
+    config: {
+      log: { loglevel: "warning" },
+      inbounds: targets.map((t) => ({
+        tag: `probe-in-${t.port}`,
+        listen: "127.0.0.1",
+        port: t.port,
+        protocol: "socks",
+        settings: { udp: false },
+      })),
+      outbounds: [...outbounds, BLOCK],
+      routing: {
+        domainStrategy: "AsIs",
+        rules: targets.map((t) => ({ type: "field", inboundTag: [`probe-in-${t.port}`], outboundTag: t.tag })),
+      },
+    },
+    targets,
+  };
+}
+
 function must<T>(map: Map<string, T>, key: string): T {
   const v = map.get(key);
   if (v === undefined) throw new Error(`channel not found: ${key}`);

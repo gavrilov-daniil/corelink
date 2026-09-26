@@ -1,6 +1,7 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { AlertService } from "../alert.service.js";
 import { AuthService } from "../../auth/auth.service.js";
+import { MonitoringService } from "../../monitoring/monitoring.service.js";
 import type { JobRunner } from "../job.types.js";
 
 /**
@@ -18,15 +19,20 @@ export class MaintenanceJob implements JobRunner {
   constructor(
     private readonly alerts: AlertService,
     private readonly auth: AuthService,
+    private readonly monitoring: MonitoringService,
   ) {}
 
   async run() {
     const dedupKeys = await this.alerts.sweep(7);
     const sessions = await this.auth.purgeExpired();
+    const probes = await this.monitoring.purge();
 
-    if (dedupKeys > 0 || sessions > 0) {
-      this.log.log(`обслуживание: удалено ключей дедупа ${dedupKeys}, протухших сессий ${sessions}`);
+    if (dedupKeys > 0 || sessions > 0 || probes.results > 0) {
+      this.log.log(
+        `обслуживание: удалено ключей дедупа ${dedupKeys}, протухших сессий ${sessions}, ` +
+          `результатов проб ${probes.results}, событий мониторинга ${probes.events}`,
+      );
     }
-    return { dedupKeys, sessions };
+    return { dedupKeys, sessions, probeResults: probes.results, monitorEvents: probes.events };
   }
 }

@@ -1250,3 +1250,58 @@ export const updatePlan = (
     squadIds?: string[];
   },
 ) => request<Plan>(`/api/admin/plans/${id}`, patch(body));
+
+// --- Мониторинг: синтетическая проба сети ------------------------------------
+
+/** Точка наблюдения: dc — воркер платформы, home — устройство в РФ-сети. */
+export interface MonitoringProbe {
+  id: string;
+  kind: string;
+  name: string;
+  /** Давний прогон = мониторинг молчит (воркер лежит), а не «всё хорошо». */
+  lastRunAt: string | null;
+  /** Сбой самой пробы (нет xray/curl), а не падение нод. */
+  lastError: string | null;
+}
+
+export interface MonitoringChannel {
+  probeId: string;
+  channelTag: string;
+  nodeId: string | null;
+  ok: boolean;
+  latencyMs: number | null;
+  error: string | null;
+  checkedAt: string;
+  checks24h: number;
+  passed24h: number;
+}
+
+export interface MonitoringNode {
+  id: string;
+  name: string;
+  country: string | null;
+  heartbeatAt: string | null;
+  xrayError: string | null;
+}
+
+export interface MonitoringEvent {
+  id: string;
+  kind: string;
+  probeId: string | null;
+  nodeId: string | null;
+  channelTag: string | null;
+  message: string | null;
+  createdAt: string;
+}
+
+export interface MonitoringOverview {
+  probes: MonitoringProbe[];
+  channels: MonitoringChannel[];
+  nodes: MonitoringNode[];
+  events: MonitoringEvent[];
+}
+
+export const getMonitoring = () => request<MonitoringOverview>("/api/admin/monitoring");
+
+/** Джоба воркеру вне расписания. Результата в ответе нет — он появится там, куда джоба пишет. */
+export const enqueueJob = (name: string) => request<{ queued: boolean }>(`/api/admin/jobs/${name}/enqueue`, post());

@@ -149,6 +149,29 @@ export class SubscriptionRepository {
   }
 
   /**
+   * Вход синтетической пробы: ровно те каналы, что увидит в выдаче подписка с таким
+   * доступом (тот же отбор и тот же фильтр по squad'ам), но без профилей — проверяется
+   * каждый канал, а не собранный профиль. nodeByTag — чья нода за каналом, для истории.
+   */
+  async loadProbeInput(
+    orgId: string,
+    subscription: typeof schema.subscription.$inferSelect,
+  ): Promise<{ input: GeneratorInput; nodeByTag: Map<string, string | null> }> {
+    const all = await this.loadChannels(orgId);
+    const open = await this.loadOpenInbounds(orgId, subscription.id);
+    const reachable = all.filter((c) => open.has(c.inboundId));
+    return {
+      input: {
+        vlessUuid: subscription.vlessUuid,
+        channels: reachable.map((c) => c.channel),
+        front: await this.loadFront(orgId),
+        domainList: { zones: [], domains: [] },
+      },
+      nodeByTag: new Map(reachable.map((c) => [c.channel.tag, c.nodeId])),
+    };
+  }
+
+  /**
    * Входы, открытые подписке: из общего squad'а (у всех) и из её собственных. Канал на
    * закрытом входе клиенту не показываем: нода его не пустит, а в конфиге он выглядел
    * бы рабочим — отдельный профиль страны из таких каналов был бы клиентом без интернета.
@@ -181,7 +204,9 @@ export class SubscriptionRepository {
    * цепочку — чёрную дыру без единого сообщения клиенту).
    * inboundId — вход хоста: по нему решается, открыт ли канал этой подписке.
    */
-  private async loadChannels(orgId: string): Promise<Array<{ inboundId: string; channel: ChannelInput }>> {
+  private async loadChannels(
+    orgId: string,
+  ): Promise<Array<{ inboundId: string; nodeId: string | null; channel: ChannelInput }>> {
     const rows = await this.db
       .select({ ch: schema.channel, host: schema.host, link: schema.cascadeLink, inbound: schema.inbound })
       .from(schema.channel)
@@ -211,6 +236,7 @@ export class SubscriptionRepository {
       .filter((r) => !r.ch.cascadeLinkId || r.link?.status === "active")
       .map(({ ch, host, inbound }) => ({
         inboundId: host!.inboundId,
+        nodeId: host!.nodeId,
         channel: {
           kind: ch.kind as "direct" | "cascade",
           tag: ch.newTag ?? ch.tag,

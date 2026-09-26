@@ -2,8 +2,10 @@ export * from "./types.js";
 export {
   assembleBase,
   autoProfile,
+  buildProbeConfig,
   buildProfileConfig,
   projectVariants,
+  type ProbeTarget,
 } from "./builder.js";
 export { validateConfig, type ValidationResult } from "./validate.js";
 export {

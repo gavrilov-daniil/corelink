@@ -22,6 +22,8 @@ import { AbuseScanJob } from "./jobs/abuse-scan.job.js";
 import { AiSuggestJob } from "./jobs/ai-suggest.job.js";
 import { MaintenanceJob } from "./jobs/maintenance.job.js";
 import { ProvisionResumeJob } from "./jobs/provision-resume.job.js";
+import { NodeProbeJob } from "./jobs/node-probe.job.js";
+import { MonitoringModule } from "../monitoring/monitoring.module.js";
 
 @Module({
   imports: [
@@ -30,6 +32,7 @@ import { ProvisionResumeJob } from "./jobs/provision-resume.job.js";
     PaymentsModule, // ledger для реф-наград
     BotModule, // алерты операторам
     AiModule, // подсказки поддержке
+    MonitoringModule, // синтетическая проба сети и чистка её истории
   ],
   controllers: [WorkersAdminController],
   providers: [
@@ -49,6 +52,7 @@ import { ProvisionResumeJob } from "./jobs/provision-resume.job.js";
     AiSuggestJob,
     MaintenanceJob,
     ProvisionResumeJob,
+    NodeProbeJob,
     JobRegistry,
   ],
   exports: [QueueService, SchedulerService, JobRegistry],

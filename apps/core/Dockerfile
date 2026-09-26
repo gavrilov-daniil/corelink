@@ -31,6 +31,26 @@ ENV NODE_ENV=production
 ARG GIT_SHA=dev
 ENV APP_VERSION=$GIT_SHA
 
+# Синтетическая проба сети (MonitoringService) гоняет трафик через каналы локальным
+# Xray и curl — той же версией Xray, что на нодах. Бинарь из релиза XTLS со сверкой
+# SHA256 из его же .dgst: подменённый архив не доедет до образа.
+ARG XRAY_VERSION=26.3.27
+RUN apk add --no-cache curl unzip \
+ && case "$(apk --print-arch)" in \
+      x86_64) XRAY_ASSET=Xray-linux-64.zip ;; \
+      aarch64) XRAY_ASSET=Xray-linux-arm64-v8a.zip ;; \
+      *) echo "нет сборки Xray под $(apk --print-arch)"; exit 1 ;; \
+    esac \
+ && base="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}" \
+ && wget -q -O /tmp/xray.zip "$base/$XRAY_ASSET" \
+ && wget -q -O /tmp/xray.dgst "$base/$XRAY_ASSET.dgst" \
+ && expect="$(awk -F'= ' '/^SHA2-256=/{print $2}' /tmp/xray.dgst)" \
+ && [ -n "$expect" ] && echo "$expect  /tmp/xray.zip" | sha256sum -c - \
+ && unzip -q -o /tmp/xray.zip xray -d /usr/local/bin \
+ && chmod 0755 /usr/local/bin/xray \
+ && rm -f /tmp/xray.zip /tmp/xray.dgst \
+ && apk del unzip
+
 # Не от root: у процесса нет причин иметь права на систему
 RUN addgroup -S app && adduser -S app -G app
 

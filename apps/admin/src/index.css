@@ -1034,3 +1034,8 @@ select {
   font-size: var(--cl-text-sm);
   color: var(--cl-text-muted);
 }
+
+/* Канал ноды на странице «Мониторинг»: бейдж, подпись и ошибка строкой */
+.monitor-channel + .monitor-channel {
+  margin-top: var(--cl-space-2);
+}

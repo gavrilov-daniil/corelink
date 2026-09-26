@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { assembleBase, buildProfileConfig, projectVariants } from "./builder.js";
+import { assembleBase, buildProbeConfig, buildProfileConfig, projectVariants } from "./builder.js";
 import { validateConfig } from "./validate.js";
 import type { GeneratorInput, ProfileInput } from "./types.js";
 
@@ -362,4 +362,42 @@ test("резервный тир каскадов идёт с random — как �
   assert.equal(tier1.strategy.type, "leastPing", "первичный тир обязан мерить задержку");
   assert.equal(tier2.strategy.type, "random");
   assert.equal(validateConfig(cfg).ok, true);
+});
+
+test("проба: по SOCKS-входу на канал, outbound'ы байт-в-байт как в клиентском конфиге", () => {
+  const input = fixture();
+  const { config, targets } = buildProbeConfig(input, 20000) as { config: any; targets: Array<{ tag: string; port: number }> };
+
+  assert.deepEqual(targets, [
+    { tag: "de-direct", port: 20000 },
+    { tag: "pl-direct", port: 20001 },
+    { tag: "pl-cascade", port: 20002 },
+  ]);
+
+  // проба обязана проверять ровно то, что получит клиент, — сверяем с профилем «Авто»
+  const client = assembleBase(input) as any;
+  for (const tag of ["de-direct", "pl-direct", "pl-cascade", "frontru2"]) {
+    const inProbe = config.outbounds.find((o: any) => o.tag === tag);
+    const inClient = client.outbounds.find((o: any) => o.tag === tag);
+    assert.ok(inProbe, `в пробе нет outbound ${tag}`);
+    assert.deepEqual(inProbe, inClient, `outbound ${tag} в пробе разошёлся с клиентским`);
+  }
+
+  // каждый вход ведёт только в свой канал — иначе проба «зелёная» через соседнюю ноду
+  assert.deepEqual(
+    config.routing.rules.map((r: any) => [r.inboundTag[0], r.outboundTag]),
+    [
+      ["probe-in-20000", "de-direct"],
+      ["probe-in-20001", "pl-direct"],
+      ["probe-in-20002", "pl-cascade"],
+    ],
+  );
+  assert.ok(config.inbounds.every((i: any) => i.listen === "127.0.0.1"), "SOCKS пробы не должен торчать наружу");
+});
+
+test("проба без каскадов не тащит front", () => {
+  const input = fixture();
+  input.channels = input.channels.filter((c) => c.kind === "direct");
+  const { config } = buildProbeConfig(input, 30000) as { config: any };
+  assert.equal(config.outbounds.some((o: any) => o.tag === "frontru2"), false);
 });

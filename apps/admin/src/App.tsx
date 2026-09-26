@@ -3,6 +3,7 @@ import logoDark from "@corelink/ui/assets/logo-lockup-dark.svg";
 import MerchantsPage from "./pages/MerchantsPage";
 import InfraPage from "./pages/InfraPage";
 import NodesPage from "./pages/NodesPage";
+import MonitoringPage from "./pages/MonitoringPage";
 import SubscribersPage from "./pages/SubscribersPage";
 import SupportPage from "./pages/SupportPage";
 import SalesPage from "./pages/SalesPage";
@@ -25,6 +26,7 @@ const NAV: { to: string; label: string; role: AdminRole; element: JSX.Element }[
   { to: "/merchants", label: "Мерчанты", role: "superadmin", element: <MerchantsPage /> },
   { to: "/infra", label: "Инфраструктура", role: "admin", element: <InfraPage /> },
   { to: "/nodes", label: "Ноды и каскады", role: "admin", element: <NodesPage /> },
+  { to: "/monitoring", label: "Мониторинг", role: "support", element: <MonitoringPage /> },
   { to: "/traffic", label: "Трафик", role: "admin", element: <TrafficPage /> },
   { to: "/sales", label: "Продажи", role: "admin", element: <SalesPage /> },
   { to: "/broadcasts", label: "Рассылки", role: "admin", element: <BroadcastsPage /> },

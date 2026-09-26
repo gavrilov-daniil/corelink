@@ -7,3 +7,4 @@ export * from "./billing.js";
 export * from "./abuse.js";
 export * from "./support.js";
 export * from "./crm.js";
+export * from "./monitoring.js";
