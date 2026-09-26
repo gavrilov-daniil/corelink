@@ -719,12 +719,18 @@ export const listProvisionRuns = (serverId: string) =>
 export interface Subscriber {
   /** id подписки, не подписчика. */
   id: string;
+  subscriberId: string;
   shortUuid: string;
+  subscriptionUrl: string;
   username: string | null;
   telegramId: number | null;
+  /** Метка человека без бота (ручная выдача). */
+  label: string | null;
   status: string;
   expireAt: string | null;
   usedTrafficBytes: number;
+  /** null — без лимита. */
+  trafficLimitBytes: number | null;
   /** null — без лимита. */
   deviceLimit: number | null;
   devicesUsed: number;
@@ -770,6 +776,47 @@ export const unlinkDevice = (subscriptionId: string, hwid: string) =>
 /** Утечка ссылки: старый URL умирает, клиент получает новый в боте. */
 export const revokeSubscription = (subscriptionId: string) =>
   request<RevokeResult>(`/api/admin/subscriptions/${subscriptionId}/revoke`, { method: "POST" });
+
+/**
+ * Ручная выдача. Без subscriberId — новый человек без бота (нужна метка). days: null — бессрочно;
+ * лимит null — без лимита. requestId — один на открытую форму: повтор не заведёт второго человека.
+ */
+export interface ManualGrantInput {
+  subscriberId?: string;
+  label?: string;
+  days: number | null;
+  deviceLimit?: number | null;
+  trafficGb?: number | null;
+  squadIds?: string[];
+}
+
+export interface ManualGrantResult {
+  subscriptionId: string;
+  subscriberId: string;
+  status: string;
+  expireAt: string | null;
+  subscriptionUrl: string;
+}
+
+export const grantManualSubscription = (body: ManualGrantInput, requestId: string) =>
+  request<ManualGrantResult>("/api/admin/subscriptions/manual", {
+    ...post(body),
+    headers: { "content-type": "application/json", "x-client-request-id": requestId },
+  });
+
+/** Продление: от текущего окончания, если оно впереди, иначе от сегодня. */
+export const extendSubscription = (subscriptionId: string, days: number, requestId: string) =>
+  request<{ subscriptionId: string; status: string; expireAt: string | null }>(
+    `/api/admin/subscriptions/${subscriptionId}/extend`,
+    { ...post({ days }), headers: { "content-type": "application/json", "x-client-request-id": requestId } },
+  );
+
+/** Отключить (disabled) или включить (снимает disabled и suspended). Повтор ничего не меняет. */
+export const setSubscriptionEnabled = (subscriptionId: string, enabled: boolean) =>
+  request<{ subscriptionId: string; status: string; changed: boolean }>(
+    `/api/admin/subscriptions/${subscriptionId}/${enabled ? "enable" : "disable"}`,
+    post(),
+  );
 
 // --- Поддержка --------------------------------------------------------------
 

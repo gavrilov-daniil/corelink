@@ -12,6 +12,8 @@ import { CrmModule } from "../crm/crm.module.js";
   imports: [CrmModule], // атрибуция оплаченного платежа (после коммита транзакции)
   controllers: [PaymentsController, MerchantsAdminController, StarsController],
   providers: [PaymentService, MerchantService, LedgerService, IdempotencyService],
-  exports: [PaymentService, MerchantService, LedgerService],
+  // IdempotencyService — один экземпляр на процесс: ручная выдача из админки держит
+  // барьер дабл-клика на том же Redis-соединении, что и создание счёта
+  exports: [PaymentService, MerchantService, LedgerService, IdempotencyService],
 })
 export class PaymentsModule {}

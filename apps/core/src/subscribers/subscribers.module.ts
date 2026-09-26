@@ -6,8 +6,9 @@ import { CrmModule } from "../crm/crm.module.js";
 import { NodesModule } from "../nodes/nodes.module.js";
 
 @Module({
-  // LedgerService для баланса, AttributionService для атрибуции,
-  // NodeStateService — пересборка desired-state после revoke (сменился vless_uuid)
+  // LedgerService для баланса, IdempotencyService — дабл-клик ручной выдачи,
+  // AttributionService для атрибуции, NodeStateService — пересборка desired-state
+  // после revoke (сменился vless_uuid) и после ручной выдачи/отключения
   imports: [PaymentsModule, CrmModule, NodesModule],
   controllers: [SubscribersController],
   providers: [SubscribersService],

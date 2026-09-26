@@ -1,10 +1,14 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post } from "@nestjs/common";
+import { Body, Controller, Delete, Get, Headers, Param, Patch, Post } from "@nestjs/common";
 import { MinRole } from "../auth/roles.js";
-import { SubscribersService } from "./subscribers.service.js";
+import { IdempotencyService } from "../common/idempotency.service.js";
+import { SubscribersService, type ManualGrantInput } from "./subscribers.service.js";
 
 @Controller()
 export class SubscribersController {
-  constructor(private readonly subscribers: SubscribersService) {}
+  constructor(
+    private readonly subscribers: SubscribersService,
+    private readonly idempotency: IdempotencyService,
+  ) {}
 
   /** Бот зовёт на каждый /start: найти подписчика или создать. */
   @Post("internal/subscribers/resolve")
@@ -55,6 +59,37 @@ export class SubscribersController {
   @Post("api/admin/subscriptions/:id/revoke")
   revoke(@Param("id") id: string) {
     return this.subscribers.revoke(id);
+  }
+
+  /**
+   * Ручная выдача: новому человеку без бота или подписчику из бота. Идемпотентно по
+   * x-client-request-id: дабл-клик не заведёт второго человека и не начислит дни дважды.
+   */
+  @Post("api/admin/subscriptions/manual")
+  grantManual(@Body() body: ManualGrantInput, @Headers("x-client-request-id") clientRequestId?: string) {
+    return this.idempotency.run("subscription-manual", clientRequestId, () => this.subscribers.grantManual(body ?? {}));
+  }
+
+  @Post("api/admin/subscriptions/:id/extend")
+  extend(
+    @Param("id") id: string,
+    @Body() body: { days?: unknown },
+    @Headers("x-client-request-id") clientRequestId?: string,
+  ) {
+    return this.idempotency.run(`subscription-extend:${id}`, clientRequestId, () =>
+      this.subscribers.extend(id, body?.days),
+    );
+  }
+
+  /** Отключение и включение идемпотентны сами: повтор статус не меняет. */
+  @Post("api/admin/subscriptions/:id/disable")
+  disable(@Param("id") id: string) {
+    return this.subscribers.setEnabled(id, false);
+  }
+
+  @Post("api/admin/subscriptions/:id/enable")
+  enable(@Param("id") id: string) {
+    return this.subscribers.setEnabled(id, true);
   }
 
   // --- управление тарифами из админки ---

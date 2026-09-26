@@ -83,8 +83,12 @@ export class AdminController {
       id: sub.id,
       subscriberId: sub.subscriberId,
       shortUuid: sub.shortUuid,
+      // ручная выдача отдаёт ссылку оператору — без неё человеку без бота её не передать
+      subscriptionUrl: `https://${this.cfg.subPublicHost}/auto/${sub.shortUuid}`,
       username: s?.username ?? null,
       telegramId: s?.telegramId ?? null,
+      // метка человека без бота (ручная выдача): кроме неё его в списке не опознать
+      label: s?.description ?? null,
       status: sub.status,
       expireAt: sub.expireAt,
       usedTrafficBytes: Number(sub.usedTrafficBytes ?? 0),

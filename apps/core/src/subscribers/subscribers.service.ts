@@ -1,6 +1,6 @@
 import { BadRequestException, Inject, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { randomBytes, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, gte, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, or, sql } from "drizzle-orm";
 import { schema, type Database } from "@corelink/db";
 import { DB } from "../db/db.module.js";
 import { loadConfig } from "../config.js";
@@ -15,6 +15,41 @@ function generateShortUuid(): string {
 
 /** Соединение или транзакция — читающему хелперу достаточно select. */
 type Selectable = Pick<Database, "select">;
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Потолок ручной выдачи и продления — 10 лет; больше — это «бессрочно», а не опечатка. */
+const MAX_GRANT_DAYS = 3650;
+
+/**
+ * Ручная выдача из админки. Без subscriberId — новый человек без бота (нужна метка).
+ * Лимит null — «без лимита»; не прислан — у подписки из бота не трогаем.
+ */
+export interface ManualGrantInput {
+  subscriberId?: string;
+  label?: string;
+  /** Срок в днях; null — бессрочно. */
+  days?: number | null;
+  deviceLimit?: number | null;
+  trafficGb?: number | null;
+  /** Свои squad'ы — добавляются к имеющимся; общий у всех и так. */
+  squadIds?: string[];
+}
+
+interface Grant {
+  days: number | null;
+  deviceLimit: number | null | undefined;
+  trafficGb: number | null | undefined;
+  squadIds: string[];
+}
+
+/**
+ * Статус после выдачи или продления: блокировку (disabled / suspended) они не снимают —
+ * это делает только явное «Включить», иначе продление молча вернуло бы доступ
+ * приостановленному за abuse.
+ */
+const statusAfterGrant = sql`case when ${schema.subscription.status} in ('disabled', 'suspended')
+  then ${schema.subscription.status} else 'active' end`;
 
 @Injectable()
 export class SubscribersService {
@@ -233,7 +268,7 @@ export class SubscribersService {
     sortOrder?: number;
     squadIds?: string[];
   }) {
-    await this.assertPlanSquads(input.squadIds);
+    await this.assertSquadsExist(input.squadIds);
     const [row] = await this.db
       .insert(schema.plan)
       .values({
@@ -271,7 +306,7 @@ export class SubscribersService {
       if (value !== undefined) values[key] = value;
     }
     if (Object.keys(values).length === 0) throw new BadRequestException("нечего обновлять");
-    await this.assertPlanSquads(patch.squadIds);
+    await this.assertSquadsExist(patch.squadIds);
 
     const [row] = await this.db
       .update(schema.plan)
@@ -283,15 +318,14 @@ export class SubscribersService {
   }
 
   /**
-   * squad'ы тарифа существуют в org? Чужой id в тарифе ронял бы фулфилмент оплаты:
-   * вставка subscription_squad падает по FK внутри транзакции платежа — деньги
-   * приняты, дней нет.
+   * squad'ы существуют в org? Чужой id в тарифе ронял бы фулфилмент оплаты: вставка
+   * subscription_squad падает по FK внутри транзакции платежа — деньги приняты, дней нет.
+   * При ручной выдаче тот же FK уронил бы её целиком.
    */
-  private async assertPlanSquads(squadIds: string[] | undefined): Promise<void> {
+  private async assertSquadsExist(squadIds: string[] | undefined): Promise<void> {
     if (squadIds === undefined) return;
     if (!Array.isArray(squadIds)) throw new BadRequestException("squadIds: ожидается массив uuid");
     if (squadIds.length === 0) return;
-    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     const malformed = squadIds.filter((id) => typeof id !== "string" || !UUID_RE.test(id));
     if (malformed.length > 0) throw new BadRequestException(`squadIds: не uuid — ${malformed.join(", ")}`);
 
@@ -439,6 +473,175 @@ export class SubscribersService {
     };
   }
 
+  /**
+   * Ручная выдача из админки — без оплаты и без бота.
+   *
+   * Новому человеку заводится подписчик без Telegram: метка лежит в description, по ней
+   * его находят в списке. Подписчику из бота доступ выдаётся на ОСНОВНУЮ подписку, а не
+   * на вторую: бот показывает клиенту самую раннюю, и вторую ссылку тот бы не увидел.
+   *
+   * Денег здесь нет — ledger не трогаем. Повтор запроса гасит x-client-request-id на
+   * контроллере: без него дабл-клик завёл бы двух человек или начислил дни дважды.
+   */
+  async grantManual(input: ManualGrantInput) {
+    const grant: Grant = {
+      days: grantDays(input.days, true),
+      deviceLimit: optionalLimit(input.deviceLimit, "deviceLimit", 100),
+      trafficGb: optionalLimit(input.trafficGb, "trafficGb", 100_000),
+      squadIds: input.squadIds ?? [],
+    };
+    await this.assertSquadsExist(input.squadIds);
+
+    const subscription =
+      input.subscriberId === undefined
+        ? await this.createManualSubscriber(manualLabel(input.label), grant)
+        : await this.grantToSubscriber(requireUuid(input.subscriberId, "subscriberId"), grant);
+
+    // статус и срок — это список клиентов на нодах: без пересборки доступ не заработает
+    const rebuild = await this.nodes.rebuildAll();
+    this.log.log(
+      `подписка ${subscription.id}: ручная выдача до ${subscription.expireAt?.toISOString() ?? "бессрочно"}, ` +
+        `нод пересобрано ${rebuild.changed.length}`,
+    );
+    return {
+      subscriptionId: subscription.id,
+      subscriberId: subscription.subscriberId,
+      status: subscription.status,
+      expireAt: subscription.expireAt,
+      subscriptionUrl: `https://${this.cfg.subPublicHost}/auto/${subscription.shortUuid}`,
+    };
+  }
+
+  private async createManualSubscriber(label: string, grant: Grant) {
+    return this.db.transaction(async (tx) => {
+      const [person] = await tx
+        .insert(schema.subscriber)
+        .values({ orgId: this.cfg.defaultOrgId, description: label, status: "active" })
+        .returning();
+      const [created] = await tx
+        .insert(schema.subscription)
+        .values({
+          orgId: this.cfg.defaultOrgId,
+          subscriberId: person.id,
+          shortUuid: generateShortUuid(),
+          vlessUuid: randomUUID(),
+          status: "active",
+          expireAt: grant.days === null ? null : new Date(Date.now() + grant.days * 86_400_000),
+          hwidDeviceLimit: grant.deviceLimit ?? null,
+          trafficLimitBytes: grant.trafficGb ? grant.trafficGb * 1024 ** 3 : null,
+        })
+        .returning();
+      if (grant.squadIds.length > 0) {
+        await tx
+          .insert(schema.subscriptionSquad)
+          .values(grant.squadIds.map((squadId) => ({ subscriptionId: created.id, squadId })))
+          .onConflictDoNothing();
+      }
+      return created;
+    });
+  }
+
+  private async grantToSubscriber(subscriberId: string, grant: Grant) {
+    await this.getById(subscriberId);
+    const primary = await this.ensureSubscription(subscriberId);
+
+    return this.db.transaction(async (tx) => {
+      const [row] = await tx
+        .update(schema.subscription)
+        .set({
+          expireAt:
+            grant.days === null
+              ? null
+              : sql`greatest(${schema.subscription.expireAt}, now()) + make_interval(days => ${grant.days}::int)`,
+          status: statusAfterGrant,
+          ...(grant.deviceLimit !== undefined ? { hwidDeviceLimit: grant.deviceLimit } : {}),
+          ...(grant.trafficGb !== undefined
+            ? { trafficLimitBytes: grant.trafficGb ? grant.trafficGb * 1024 ** 3 : null }
+            : {}),
+          updatedAt: new Date(),
+        })
+        .where(and(eq(schema.subscription.id, primary.id), notForever(grant.days)))
+        .returning();
+      if (!row) throw new BadRequestException("подписка бессрочная — дни добавлять некуда");
+
+      if (grant.squadIds.length > 0) {
+        await tx
+          .insert(schema.subscriptionSquad)
+          .values(grant.squadIds.map((squadId) => ({ subscriptionId: row.id, squadId })))
+          .onConflictDoNothing();
+      }
+      return row;
+    });
+  }
+
+  /**
+   * Продление из админки: от текущего окончания, если оно впереди, иначе от сегодня.
+   * Одним UPDATE — без read-modify-write против параллельной оплаты, которая тоже
+   * двигает срок. Бессрочную продлевать некуда.
+   */
+  async extend(subscriptionId: string, rawDays: unknown) {
+    requireUuid(subscriptionId, "id");
+    const days = grantDays(rawDays, false)!;
+    await this.getSubscription(subscriptionId);
+
+    const [row] = await this.db
+      .update(schema.subscription)
+      .set({
+        expireAt: sql`greatest(${schema.subscription.expireAt}, now()) + make_interval(days => ${days}::int)`,
+        status: statusAfterGrant,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(schema.subscription.orgId, this.cfg.defaultOrgId),
+          eq(schema.subscription.id, subscriptionId),
+          notForever(days),
+        ),
+      )
+      .returning();
+    if (!row) throw new BadRequestException("подписка бессрочная — продлевать некуда");
+
+    const rebuild = await this.nodes.rebuildAll();
+    this.log.log(`подписка ${subscriptionId}: продлена на ${days} дн до ${row.expireAt?.toISOString()}, нод пересобрано ${rebuild.changed.length}`);
+    return { subscriptionId, status: row.status, expireAt: row.expireAt };
+  }
+
+  /**
+   * Отключение из админки — статус disabled: выдача отдаёт заглушку «приостановлена»,
+   * с нод клиент уходит при пересборке. Включение снимает и disabled, и suspended
+   * (приостановку за abuse снимают вручную — это она), а срок проверяет тут же, чтобы
+   * истёкшая подписка не ожила как active. Повтор ничего не меняет.
+   *
+   * Неактивированную (inactive) не отключаем: включение сделало бы из неё active
+   * без срока — бесплатный бессрочный доступ.
+   */
+  async setEnabled(subscriptionId: string, enabled: boolean) {
+    requireUuid(subscriptionId, "id");
+    const current = await this.getSubscription(subscriptionId);
+    const scope = and(eq(schema.subscription.orgId, this.cfg.defaultOrgId), eq(schema.subscription.id, subscriptionId));
+
+    const [row] = enabled
+      ? await this.db
+          .update(schema.subscription)
+          .set({
+            status: sql`case when ${schema.subscription.expireAt} is null or ${schema.subscription.expireAt} > now()
+              then 'active' else 'expired' end`,
+            updatedAt: new Date(),
+          })
+          .where(and(scope, inArray(schema.subscription.status, ["disabled", "suspended"])))
+          .returning()
+      : await this.db
+          .update(schema.subscription)
+          .set({ status: "disabled", updatedAt: new Date() })
+          .where(and(scope, inArray(schema.subscription.status, ["active", "trial", "suspended", "expired"])))
+          .returning();
+    if (!row) return { subscriptionId, status: current.status, changed: false };
+
+    const rebuild = await this.nodes.rebuildAll();
+    this.log.warn(`подписка ${subscriptionId}: ${current.status} → ${row.status} из админки, нод пересобрано ${rebuild.changed.length}`);
+    return { subscriptionId, status: row.status, changed: true };
+  }
+
   private async getSubscription(subscriptionId: string) {
     const [row] = await this.db
       .select()
@@ -465,4 +668,45 @@ export class SubscribersService {
     if (!row) throw new NotFoundException("подписчик не найден");
     return row;
   }
+}
+
+function requireUuid(value: unknown, field: string): string {
+  if (typeof value !== "string" || !UUID_RE.test(value)) throw new BadRequestException(`${field}: ожидается uuid`);
+  return value;
+}
+
+/** Срок выдачи в днях. null — бессрочно, если это допустимо (при продлении — нет). */
+function grantDays(value: unknown, allowForever: boolean): number | null {
+  if (value === null && allowForever) return null;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > MAX_GRANT_DAYS) {
+    throw new BadRequestException(`days: целое 1..${MAX_GRANT_DAYS}${allowForever ? " или null (бессрочно)" : ""}`);
+  }
+  return value;
+}
+
+/** Лимит: целое 1..max, null — без лимита, не прислан — не трогать. */
+function optionalLimit(value: unknown, field: string, max: number): number | null | undefined {
+  if (value === undefined || value === null) return value;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > max) {
+    throw new BadRequestException(`${field}: целое 1..${max} или null (без лимита)`);
+  }
+  return value;
+}
+
+/** Метка человека без бота: по ней его находят в списке подписчиков. */
+function manualLabel(value: unknown): string {
+  const label = typeof value === "string" ? value.trim() : "";
+  if (label.length === 0 || label.length > 128) {
+    throw new BadRequestException("label: кто это — обязательная метка до 128 символов");
+  }
+  return label;
+}
+
+/**
+ * Дни добавляются только к подписке со сроком. expire_at IS NULL у неактивированной
+ * (inactive) — это «ещё не выдавали», а у остальных — бессрочная: к ней дни не прибавить.
+ */
+function notForever(days: number | null) {
+  if (days === null) return undefined;
+  return or(isNotNull(schema.subscription.expireAt), eq(schema.subscription.status, "inactive"));
 }
