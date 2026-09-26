@@ -1,9 +1,120 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
-import { buildProvisionScript } from "./provision-script.js";
+import { buildProvisionScript, firewallStep, portCheckStep } from "./provision-script.js";
+
+/**
+ * Выполняет шаг скрипта настоящим bash, подменяя системные утилиты заглушками:
+ * заглушка пишет свой вызов в calls.log и отвечает заданным текстом. Так проверяется
+ * поведение (разбор вывода ss, выбор фаервола), а не только наличие строк в скрипте.
+ */
+function runStep(step: string, stubs: Record<string, string>) {
+  const dir = mkdtempSync(join(tmpdir(), "provision-step-"));
+  const log = join(dir, "calls.log");
+  for (const [name, body] of Object.entries(stubs)) {
+    const path = join(dir, name);
+    writeFileSync(path, `#!/bin/bash\necho "${name} $*" >> "${log}"\n${body}\n`);
+    chmodSync(path, 0o755);
+  }
+  const res = spawnSync("bash", ["-c", `set -euo pipefail\n${step}`], {
+    env: { PATH: `${dir}:/usr/bin:/bin` },
+    encoding: "utf8",
+  });
+  return {
+    code: res.status,
+    out: `${res.stdout}${res.stderr}`,
+    calls: existsSync(log) ? readFileSync(log, "utf8") : "",
+  };
+}
+
+/** Заглушка ss: на указанном порту слушает процесс proc (как в `ss -ltnpH` под root). */
+const ssListening = (port: number, proc: string) =>
+  `case "$*" in *":${port}"*) echo 'LISTEN 0 4096 0.0.0.0:${port} 0.0.0.0:* users:(("${proc}",pid=1678,fd=8))';; esac`;
+
+describe("шаг «порты входа»", () => {
+  it("свободный порт пропускает дальше", () => {
+    const r = runStep(portCheckStep([8443]), { ss: "true" });
+    assert.equal(r.code, 0);
+    assert.match(r.out, /порт 8443 свободен/);
+  });
+
+  it("порт под чужим процессом — стоп с понятной причиной (de1-exit: 443 держал Caddy)", () => {
+    const r = runStep(portCheckStep([443]), { ss: ssListening(443, "docker-proxy") });
+    assert.equal(r.code, 1, "установка на занятый порт молча уронила бы Xray на bind");
+    assert.match(r.out, /порт 443 занят процессом docker-proxy — выберите другой порт в мастере/);
+  });
+
+  it("порт под нашим xray — это повторная настройка, не ошибка", () => {
+    const r = runStep(portCheckStep([443]), { ss: ssListening(443, "xray") });
+    assert.equal(r.code, 0);
+    assert.match(r.out, /уже слушает наш xray/);
+  });
+
+  it("слушатель без имени процесса считаем занятым", () => {
+    const r = runStep(portCheckStep([443]), { ss: `echo 'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:*'` });
+    assert.equal(r.code, 1);
+    assert.match(r.out, /занят процессом без имени/);
+  });
+
+  it("проверяет каждый порт входа, а не один 443", () => {
+    const r = runStep(portCheckStep([443, 8443]), { ss: ssListening(8443, "nginx") });
+    assert.equal(r.code, 1);
+    assert.match(r.out, /порт 443 свободен/);
+    assert.match(r.out, /порт 8443 занят процессом nginx/);
+  });
+});
+
+describe("шаг «фаервол»", () => {
+  it("активный ufw — открывает порт входа с пометкой", () => {
+    const r = runStep(firewallStep([8443]), {
+      ufw: `if [ "$1" = status ]; then echo "Status: active"; else echo "Rule added"; echo "Rule added (v6)"; fi`,
+    });
+    assert.equal(r.code, 0);
+    assert.match(r.calls, /ufw allow 8443\/tcp comment corelink xray/);
+    assert.match(r.out, /ufw: 8443\/tcp — Rule added Rule added \(v6\)/);
+  });
+
+  it("повтор на ufw не плодит правило: ufw сам пропускает существующее", () => {
+    const r = runStep(firewallStep([8443]), {
+      ufw: `if [ "$1" = status ]; then echo "Status: active"; else echo "Skipping adding existing rule"; fi`,
+    });
+    assert.equal(r.code, 0);
+    assert.match(r.out, /Skipping adding existing rule/);
+  });
+
+  it("ufw установлен, но выключен, а firewalld работает — открывает через firewall-cmd", () => {
+    const r = runStep(firewallStep([8443]), {
+      ufw: `echo "Status: inactive"`,
+      "firewall-cmd": `if [ "$1" = --state ]; then echo running; else echo success; fi`,
+    });
+    assert.equal(r.code, 0);
+    assert.match(r.calls, /firewall-cmd --permanent --add-port=8443\/tcp/);
+    assert.match(r.calls, /firewall-cmd --reload/);
+    assert.doesNotMatch(r.calls, /ufw allow/);
+  });
+
+  it("фаервол не активен — ничего не трогает", () => {
+    const r = runStep(firewallStep([8443]), { ufw: `echo "Status: inactive"` });
+    assert.equal(r.code, 0);
+    assert.match(r.out, /не активен — порты не трогаем/);
+    assert.doesNotMatch(r.calls, /allow|add-port/);
+  });
+
+  it("ufw не смог открыть порт — стоп, а не молча недоступная нода", () => {
+    const r = runStep(firewallStep([8443]), {
+      ufw: `if [ "$1" = status ]; then echo "Status: active"; else echo "ERROR: bad port" >&2; exit 1; fi`,
+    });
+    assert.equal(r.code, 1);
+    assert.match(r.out, /ufw не открыл 8443\/tcp/);
+  });
+});
 
 describe("buildProvisionScript", () => {
   const base = {
+    inboundPorts: [8443],
     repo: "acme/corelink",
     agentRelease: "v1.2.3",
     controlPlaneUrl: "https://sub.example.com",
@@ -68,5 +179,28 @@ describe("buildProvisionScript", () => {
     assert.match(s, /set -euo pipefail/);
     assert.match(s, /systemctl restart node-agent\.service/);
     assert.match(s, /journalctl -u node-agent\.service/);
+  });
+
+  it("проверяет порты входа из inbound'ов ДО установки Xray и открывает их в фаерволе перед запуском", () => {
+    const s = buildProvisionScript({ ...base, inboundPorts: [8443, 8443, 2087] });
+    const ports = s.indexOf("=== 3/9 порты входа: 8443 2087 ===");
+    const xray = s.indexOf("=== 4/9 Xray ===");
+    const firewall = s.indexOf("=== 8/9 фаервол ===");
+    const start = s.indexOf("=== 9/9 запуск ===");
+    assert.ok(ports > 0 && ports < xray, "занятый порт надо поймать до установки, а не после");
+    assert.ok(firewall > xray && firewall < start);
+    assert.match(s, /for port in 8443 2087; do/, "порты — из inbound'ов, без повторов и без хардкода 443");
+    assert.doesNotMatch(s, /for port in 443/);
+  });
+
+  it("даёт агенту читать журнал Xray, чтобы причина падения доходила до админки", () => {
+    assert.match(buildProvisionScript(base), /SupplementaryGroups=systemd-journal/);
+  });
+
+  it("скрипт целиком синтаксически корректен для bash (bash -n)", () => {
+    for (const inboundPorts of [[8443], []]) {
+      const res = spawnSync("bash", ["-n"], { input: buildProvisionScript({ ...base, inboundPorts }), encoding: "utf8" });
+      assert.equal(res.status, 0, `bash -n: ${res.stderr}`);
+    }
   });
 });

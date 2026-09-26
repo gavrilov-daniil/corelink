@@ -8,13 +8,17 @@
  * если unit уже есть; бинарь, конфиг, unit агента перезаписываем). Это и есть
  * «перепрофилирование» на уровне сервера — тот же прогон с новым bootstrap-токеном.
  *
- * Три способа сломать, которые скрипт закрывает явно (set -euo pipefail + проверки):
+ * Способы сломать, которые скрипт закрывает явно (set -euo pipefail + проверки):
  *   1. Не тот дистрибутив/арх — падаем на detect с внятным сообщением, а не на apt.
  *   2. Подменённый бинарь агента — проверяем SHA256 против SHA256SUMS из того же
  *      релиза; несовпадение = стоп до установки.
  *   3. Xray читает не тот конфиг — официальный installer кладёт его в
  *      /usr/local/etc/xray, а агент пишет в /etc/xray (его дефолт и ReadWritePaths
  *      в unit). Сводим оба на /etc/xray drop-in'ом к xray.service.
+ *   4. Порт входа держит чужой процесс — стоп до установки: иначе Xray молча упадёт
+ *      на bind, а агент будет крутить рестарты.
+ *   5. Активный фаервол с default deny дропает вход снаружи — открываем порты входов
+ *      в ufw/firewalld.
  *
  * Секреты: bootstrap-токен попадает только в config.json на сервере (heredoc его не
  * печатает в stdout). В лог прогона уходит именно stdout, не текст скрипта.
@@ -37,6 +41,7 @@ RestartSec=5
 
 User=node-agent
 Group=node-agent
+SupplementaryGroups=systemd-journal
 StateDirectory=node-agent
 StateDirectoryMode=0750
 
@@ -77,6 +82,8 @@ const XRAY_BOOTSTRAP_CONFIG = JSON.stringify(
 );
 
 export interface ProvisionScriptParams {
+  /** Порты inbound'ов ноды — те же, что уйдут в конфиг Xray: их проверяем и открываем в фаерволе. */
+  inboundPorts: number[];
   /** owner/repo для GitHub Release с бинарём агента. */
   repo: string;
   /** Тег релиза агента ("v0.1.0") или "latest". */
@@ -88,6 +95,71 @@ export interface ProvisionScriptParams {
   bootstrapToken: string;
   /** Прибить версию Xray (напр. "1.8.24"); пусто — последняя от installer'а. */
   xrayVersion?: string;
+}
+
+/** Порты для bash: только валидные целые, без повторов — значения уходят в скрипт как есть. */
+function portList(ports: number[]): string {
+  return [...new Set(ports.filter((p) => Number.isInteger(p) && p > 0 && p < 65536))].join(" ");
+}
+
+/**
+ * Шаг «порты входа» — ДО установки Xray. Порт, который держит чужой процесс, — это
+ * Xray, который после установки молча упадёт на bind (de1-exit 26.09.2026: 443 держал
+ * Caddy другого проекта). Наш же xray на порту — повторная настройка, это норма.
+ * Процесс без имени (чужой namespace) считаем занятым: гадать не будем.
+ */
+export function portCheckStep(ports: number[]): string {
+  const list = portList(ports);
+  if (!list) return `echo "у ноды нет входов — проверять порты нечего"`;
+  return `if ! command -v ss >/dev/null 2>&1; then
+  echo "нет утилиты ss — занятость портов не проверить"; exit 1
+fi
+for port in ${list}; do
+  listeners="$(ss -ltnpH "sport = :$port" 2>/dev/null || true)"
+  if [ -z "$listeners" ]; then
+    echo "порт $port свободен"
+    continue
+  fi
+  owners="$(printf '%s\\n' "$listeners" | grep -o 'users:(("[^"]*"' | cut -d'"' -f2 | sort -u | tr '\\n' ' ')" || true
+  others=""
+  for owner in $owners; do
+    [ "$owner" = "xray" ] || others="$others $owner"
+  done
+  if [ -z "$owners" ] || [ -n "$others" ]; then
+    echo "ОШИБКА: порт $port занят процессом\${others:- без имени} — выберите другой порт в мастере"
+    exit 1
+  fi
+  echo "порт $port уже слушает наш xray — повторная настройка"
+done`;
+}
+
+/**
+ * Шаг «фаервол»: активный ufw/firewalld с default deny молча дропал бы вход Xray
+ * снаружи. Открываем ровно порты входов; повтор безопасен — ufw пропускает
+ * существующее правило («Skipping adding existing rule»), firewalld отвечает
+ * ALREADY_ENABLED. Неактивный фаервол не трогаем.
+ */
+export function firewallStep(ports: number[]): string {
+  const list = portList(ports);
+  if (!list) return `echo "у ноды нет входов — фаервол не трогаем"`;
+  return `if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+  for port in ${list}; do
+    if ! out="$(ufw allow "$port/tcp" comment 'corelink xray' 2>&1)"; then
+      echo "ОШИБКА: ufw не открыл $port/tcp: $out"; exit 1
+    fi
+    echo "ufw: $port/tcp — $(printf '%s' "$out" | tr '\\n' ' ')"
+  done
+elif command -v firewall-cmd >/dev/null 2>&1 && [ "$(firewall-cmd --state 2>/dev/null || true)" = "running" ]; then
+  for port in ${list}; do
+    if ! out="$(firewall-cmd --permanent --add-port="$port/tcp" 2>&1)"; then
+      echo "ОШИБКА: firewalld не открыл $port/tcp: $out"; exit 1
+    fi
+    echo "firewalld: $port/tcp — $(printf '%s' "$out" | tr '\\n' ' ')"
+  done
+  firewall-cmd --reload >/dev/null
+else
+  echo "фаервол (ufw/firewalld) не активен — порты не трогаем"
+fi`;
 }
 
 /** Ссылки на бинарь агента и контрольные суммы из GitHub Release. */
@@ -120,7 +192,7 @@ export function buildProvisionScript(p: ProvisionScriptParams): string {
   return `#!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== 1/7 определение системы ==="
+echo "=== 1/9 определение системы ==="
 if [ ! -r /etc/os-release ]; then echo "нет /etc/os-release — неизвестная система"; exit 1; fi
 . /etc/os-release
 case "\${ID:-}" in
@@ -134,12 +206,15 @@ case "$(uname -m)" in
 esac
 echo "OS \${ID} \${VERSION_ID:-?}, arch $(uname -m) -> \${AGENT_ARCH}"
 
-echo "=== 2/7 базовые пакеты ==="
+echo "=== 2/9 базовые пакеты ==="
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq curl ca-certificates >/dev/null
+apt-get install -y -qq curl ca-certificates iproute2 >/dev/null
 
-echo "=== 3/7 Xray ==="
+echo "=== 3/9 порты входа: ${portList(p.inboundPorts) || "нет"} ==="
+${portCheckStep(p.inboundPorts)}
+
+echo "=== 4/9 Xray ==="
 if systemctl list-unit-files 2>/dev/null | grep -q '^xray\\.service'; then
   echo "xray.service уже установлен — пропускаем установку"
 else
@@ -169,10 +244,10 @@ ExecStart=
 ExecStart=/usr/local/bin/xray run -config /etc/xray/config.json
 XRAYDROP
 
-echo "=== 4/7 пользователь node-agent ==="
+echo "=== 5/9 пользователь node-agent ==="
 id -u node-agent >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin node-agent
 
-echo "=== 5/7 бинарь node-agent (${p.agentRelease}) ==="
+echo "=== 6/9 бинарь node-agent (${p.agentRelease}) ==="
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 curl -fsSL -o "$TMP/node-agent" "${bin}\${AGENT_ARCH}"
@@ -184,7 +259,7 @@ if [ -z "$EXPECT" ] || [ "$EXPECT" != "$ACTUAL" ]; then
 fi
 install -m 0755 "$TMP/node-agent" /usr/local/bin/node-agent
 
-echo "=== 6/7 polkit + конфиг + unit агента ==="
+echo "=== 7/9 polkit + конфиг + unit агента ==="
 install -d -m 0750 /etc/polkit-1/rules.d
 cat > /etc/polkit-1/rules.d/50-node-agent-xray.rules <<'POLKIT'
 polkit.addRule(function(action, subject) {
@@ -208,7 +283,10 @@ chmod 600 /etc/xray/config.json
 cat > /etc/systemd/system/node-agent.service <<'AGENTUNIT'
 ${NODE_AGENT_UNIT}AGENTUNIT
 
-echo "=== 7/7 запуск ==="
+echo "=== 8/9 фаервол ==="
+${firewallStep(p.inboundPorts)}
+
+echo "=== 9/9 запуск ==="
 systemctl daemon-reload
 # Xray: installer поднял его со своим путём (/usr/local/etc); рестарт применяет наш
 # drop-in на /etc/xray/config.json. || true — конфиг пока минимальный, это норма.

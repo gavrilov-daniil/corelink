@@ -106,8 +106,18 @@ export class ProvisionService {
       return;
     }
 
+    // Порты — из тех же inbound'ов, что уйдут в конфиг Xray: их скрипт проверяет на
+    // занятость до установки и открывает в фаерволе. «1 профиль = 1 нода», поэтому
+    // inbound'ы ноды — это inbound'ы её профиля.
+    const inbounds = await this.db
+      .select({ port: schema.inbound.port })
+      .from(schema.inbound)
+      .innerJoin(schema.node, eq(schema.node.configProfileId, schema.inbound.configProfileId))
+      .where(eq(schema.node.id, claimed.nodeId));
+
     const bootstrap = await this.identity.issueBootstrapToken(claimed.nodeId);
     const script = buildProvisionScript({
+      inboundPorts: inbounds.map((i) => i.port),
       repo: GITHUB_REPO,
       agentRelease: AGENT_RELEASE,
       controlPlaneUrl: `https://${this.cfg.subPublicHost}`,
