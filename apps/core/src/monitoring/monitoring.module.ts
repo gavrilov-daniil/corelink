@@ -2,7 +2,7 @@ import { Module } from "@nestjs/common";
 import { NodesModule } from "../nodes/nodes.module.js";
 import { SubscriptionModule } from "../subscription/subscription.module.js";
 import { MonitoringAdminController } from "./monitoring.admin.controller.js";
-import { MonitoringService } from "./monitoring.service.js";
+import { DEFAULT_PROBE_TIMING, MonitoringService, PROBE_TIMING } from "./monitoring.service.js";
 import { PROBE_EXECUTOR, xrayCurlExecutor } from "./probe-executor.js";
 
 @Module({
@@ -10,7 +10,11 @@ import { PROBE_EXECUTOR, xrayCurlExecutor } from "./probe-executor.js";
   // пересборка нод, когда служебной подписке пробы открывается доступ
   imports: [SubscriptionModule, NodesModule],
   controllers: [MonitoringAdminController],
-  providers: [MonitoringService, { provide: PROBE_EXECUTOR, useValue: xrayCurlExecutor }],
+  providers: [
+    MonitoringService,
+    { provide: PROBE_EXECUTOR, useValue: xrayCurlExecutor },
+    { provide: PROBE_TIMING, useValue: DEFAULT_PROBE_TIMING },
+  ],
   exports: [MonitoringService],
 })
 export class MonitoringModule {}

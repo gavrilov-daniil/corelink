@@ -16,10 +16,11 @@ import { InfraService } from "../nodes/infra.service.js";
 import { locationChannelTag } from "../nodes/location-delivery.js";
 import { NodeStateService } from "../nodes/node-state.service.js";
 import { SubscriptionRepository } from "../subscription/subscription.repository.js";
-import { MonitoringService } from "./monitoring.service.js";
+import { MonitoringService, type ProbeTiming } from "./monitoring.service.js";
 import { ProbeInfraError, type ProbeExecutor } from "./probe-executor.js";
 
 let db: Database;
+let state: NodeStateService;
 let infra: InfraService;
 let service: MonitoringService;
 /** Что вернёт исполнитель: тег канала → прошёл ли. Не указан — прошёл. */
@@ -36,11 +37,14 @@ const fakeExecutor: ProbeExecutor = async (_config, targets) => {
   });
 };
 
+/** Агента в тестах нет — ноды не сходятся никогда; ожидание сходимости проверяется отдельно. */
+const NO_WAIT: ProbeTiming = { convergeWaitMs: 0, convergePollMs: 10 };
+
 before(() => {
   db = openDb();
-  const state = new NodeStateService(db);
+  state = new NodeStateService(db);
   infra = new InfraService(db, state);
-  service = new MonitoringService(db, new SubscriptionRepository(db), state, fakeExecutor);
+  service = new MonitoringService(db, new SubscriptionRepository(db), state, fakeExecutor, NO_WAIT);
 });
 
 beforeEach(async () => {
@@ -71,6 +75,40 @@ async function location(extra: Record<string, unknown> = {}, enrolled = true) {
   return { nodeId: res.node.id, tag: locationChannelTag(res.node.id) };
 }
 
+async function converged(nodeId: string): Promise<boolean> {
+  const [row] = await db
+    .select({ desired: schema.nodeDesiredState.configHash, applied: schema.nodeReportedState.appliedConfigHash })
+    .from(schema.nodeDesiredState)
+    .leftJoin(schema.nodeReportedState, eq(schema.nodeReportedState.nodeId, schema.nodeDesiredState.nodeId))
+    .where(eq(schema.nodeDesiredState.nodeId, nodeId));
+  return Boolean(row && row.desired === row.applied);
+}
+
+/** Агент ноды: применяет конфиг, как только в нём появился служебный клиент пробы. */
+async function agentAppliesProbeAccess(nodeId: string) {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const [probe] = await db
+      .select({ vlessUuid: schema.subscription.vlessUuid })
+      .from(schema.monitorProbe)
+      .innerJoin(schema.subscription, eq(schema.subscription.id, schema.monitorProbe.subscriptionId))
+      .where(eq(schema.monitorProbe.orgId, TEST_ORG_ID));
+    const [desired] = await db.select().from(schema.nodeDesiredState).where(eq(schema.nodeDesiredState.nodeId, nodeId));
+    if (probe && desired?.users.some((u) => u.uuid === probe.vlessUuid)) {
+      await db
+        .insert(schema.nodeReportedState)
+        .values({ nodeId, appliedConfigHash: desired.configHash, heartbeatAt: new Date() })
+        .onConflictDoUpdate({
+          target: schema.nodeReportedState.nodeId,
+          set: { appliedConfigHash: desired.configHash, heartbeatAt: new Date() },
+        });
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error("служебный клиент пробы так и не попал в конфиг ноды");
+}
+
 async function events() {
   return db
     .select({ kind: schema.monitorEvent.kind, channelTag: schema.monitorEvent.channelTag })
@@ -84,10 +122,12 @@ describe("проба из дата-центра", () => {
     await location();
     const premium = await infra.createSquad({ name: "Премиум" });
 
-    const first = await service.ensureDcProbe();
-    const second = await service.ensureDcProbe();
+    const { probe: first, rebuiltNodes } = await service.ensureDcProbe();
+    const { probe: second, rebuiltNodes: rebuiltAgain } = await service.ensureDcProbe();
 
     assert.equal(first.id, second.id);
+    assert.ok(rebuiltNodes.length > 0, "новый клиент на нодах — их конфиги пересобраны");
+    assert.deepEqual(rebuiltAgain, [], "повторный вызов ничего не пересобирает — и прогон не ждёт нод");
     const probes = await db.select().from(schema.monitorProbe).where(eq(schema.monitorProbe.orgId, TEST_ORG_ID));
     assert.equal(probes.length, 1);
     const memberships = await db
@@ -141,6 +181,44 @@ describe("проба из дата-центра", () => {
 
     await service.runDcProbe();
     assert.equal((await events()).length, 3, "повторный провал ленту не засоряет");
+  });
+
+  it("первый прогон ждёт, пока ноды применят доступ пробы: без ложного «упали все»", async () => {
+    const loc = await location();
+    let convergedAtProbe: boolean | null = null;
+    const waiting = new MonitoringService(
+      db,
+      new SubscriptionRepository(db),
+      state,
+      async (config, targets) => {
+        convergedAtProbe = await converged(loc.nodeId);
+        return fakeExecutor(config, targets);
+      },
+      { convergeWaitMs: 5_000, convergePollMs: 20 },
+    );
+
+    await Promise.all([waiting.runDcProbe(), agentAppliesProbeAccess(loc.nodeId)]);
+
+    assert.equal(convergedAtProbe, true, "проба стучалась бы с uuid, которого нода ещё не знает");
+    assert.deepEqual(await events(), []);
+  });
+
+  it("нода не применила доступ за отведённое время — проба идёт как есть, а не висит", async () => {
+    const loc = await location();
+    const impatient = new MonitoringService(db, new SubscriptionRepository(db), state, fakeExecutor, {
+      convergeWaitMs: 100,
+      convergePollMs: 20,
+    });
+
+    const started = Date.now();
+    await impatient.runDcProbe();
+
+    assert.ok(Date.now() - started >= 100, "ожидание было");
+    assert.deepEqual(
+      probed.map((t) => t.tag),
+      [loc.tag],
+      "несошедшаяся нода проверяется: её провал — настоящая проблема",
+    );
   });
 
   it("плановый и ручной прогоны разом не двоят событие в ленте", async () => {

@@ -21,9 +21,9 @@ import Loading from "../components/Loading";
 /** Плановая проба — раз в 5 минут; прогон старше 15 — мониторинг молчит, а не «всё хорошо». */
 const STALE_PROBE_MS = 15 * 60_000;
 const REFRESH_MS = 60_000;
-/** Ручная проба идёт воркером: ждём, пока у точки dc сменится время прогона. */
+/** Ручная проба идёт воркером: ждём, пока у точки dc сменится время прогона (с ожиданием нод — до ~2 мин). */
 const PROBE_POLL_MS = 5_000;
-const PROBE_WAIT_MS = 120_000;
+const PROBE_WAIT_MS = 180_000;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -84,7 +84,7 @@ export default function MonitoringPage() {
           return;
         }
       }
-      setRunNotice("Воркер не выполнил пробу за 2 минуты — проверьте, запущен ли он.");
+      setRunNotice("Воркер не выполнил пробу за 3 минуты — проверьте, запущен ли он.");
     } catch (e) {
       setRunNotice(`Проба не запустилась: ${errorMessage(e)}`);
     } finally {

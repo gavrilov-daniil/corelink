@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { Inject, Injectable, Logger } from "@nestjs/common";
-import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, lt, ne, or, sql } from "drizzle-orm";
 import { schema, type Database } from "@corelink/db";
 import { buildProbeConfig } from "@corelink/xray-config";
 import { DB } from "../db/db.module.js";
@@ -10,6 +10,17 @@ import { SubscriptionRepository } from "../subscription/subscription.repository.
 import { PROBE_EXECUTOR, ProbeInfraError, type ProbeExecutor, type ProbeOutcome } from "./probe-executor.js";
 
 const DAY_MS = 86_400_000;
+
+/**
+ * Ожидание, пока ноды применят доступ пробы: агент тянет конфиг раз в ~30 с, рестарт Xray с
+ * проверкой — до 20 с. На стенде 26.09.2026 ноды сошлись за 45–55 с.
+ */
+export interface ProbeTiming {
+  convergeWaitMs: number;
+  convergePollMs: number;
+}
+export const PROBE_TIMING = Symbol("PROBE_TIMING");
+export const DEFAULT_PROBE_TIMING: ProbeTiming = { convergeWaitMs: 90_000, convergePollMs: 5_000 };
 
 /**
  * Синтетическая проба сети: трафик через каждый канал — как у настоящего клиента.
@@ -32,6 +43,7 @@ export class MonitoringService {
     private readonly repo: SubscriptionRepository,
     private readonly nodes: NodeStateService,
     @Inject(PROBE_EXECUTOR) private readonly execute: ProbeExecutor,
+    @Inject(PROBE_TIMING) private readonly timing: ProbeTiming,
   ) {}
 
   private get org(): string {
@@ -41,7 +53,8 @@ export class MonitoringService {
   /**
    * Точка dc и её служебная подписка. Подписка — в каждом squad'е: проба обязана достать
    * любой канал, иначе канал своего squad'а числился бы упавшим. Идемпотентно; новая
-   * подписка или членство — пересборка нод, иначе ноды пробу не пустят.
+   * подписка или членство — пересборка нод, иначе ноды пробу не пустят. rebuiltNodes — чьи
+   * конфиги из-за этого поменялись: до их применения проба туда не пройдёт.
    */
   async ensureDcProbe() {
     const { probe, created } = await this.db.transaction(async (tx) => {
@@ -88,13 +101,17 @@ export class MonitoringService {
     if (created || joined.length > 0) {
       const rebuild = await this.nodes.rebuildAll();
       this.log.log(`проба dc: доступ обновлён (squad'ов +${joined.length}), нод пересобрано ${rebuild.changed.length}`);
+      return { probe, rebuiltNodes: rebuild.changed };
     }
-    return probe;
+    return { probe, rebuiltNodes: [] as string[] };
   }
 
   /** Прогон пробы из дата-центра по всем каналам. Зовёт джоба node-probe — по расписанию и по кнопке в админке. */
   async runDcProbe() {
-    const probe = await this.ensureDcProbe();
+    const { probe, rebuiltNodes } = await this.ensureDcProbe();
+    // Служебный клиент есть на ноде только с применённым конфигом. Без ожидания первый прогон
+    // стучался с uuid, которого ноды ещё не знали, и рисовал «упали все» (стенд, 26.09.2026).
+    if (rebuiltNodes.length > 0) await this.waitForConvergence(rebuiltNodes);
     const [subscription] = await this.db
       .select()
       .from(schema.subscription)
@@ -125,6 +142,32 @@ export class MonitoringService {
     const failed = outcomes.filter((o) => !o.ok).map((o) => o.tag);
     if (failed.length > 0) this.log.warn(`проба dc: не прошли ${failed.join(", ")}`);
     return { channels: outcomes.length, failed, events };
+  }
+
+  /** Ждём применения конфига; не дождались — проверяем как есть: нода, не сошедшаяся за это время, и есть проблема. */
+  private async waitForConvergence(nodeIds: string[]) {
+    const deadline = Date.now() + this.timing.convergeWaitMs;
+    for (;;) {
+      const pending = await this.db
+        .select({ nodeId: schema.nodeDesiredState.nodeId })
+        .from(schema.nodeDesiredState)
+        .leftJoin(schema.nodeReportedState, eq(schema.nodeReportedState.nodeId, schema.nodeDesiredState.nodeId))
+        .where(
+          and(
+            inArray(schema.nodeDesiredState.nodeId, nodeIds),
+            or(
+              isNull(schema.nodeReportedState.appliedConfigHash),
+              ne(schema.nodeDesiredState.configHash, schema.nodeReportedState.appliedConfigHash),
+            ),
+          ),
+        );
+      if (pending.length === 0) return;
+      if (Date.now() >= deadline) {
+        this.log.warn(`проба dc: ${pending.length} нод не применили доступ пробы за ${this.timing.convergeWaitMs / 1000} с — проверяем как есть`);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, this.timing.convergePollMs));
+    }
   }
 
   /**
