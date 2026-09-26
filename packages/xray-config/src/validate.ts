@@ -272,6 +272,14 @@ export function validateConfig(config: XrayConfig): ValidationResult {
         }
       }
     }
+    // 12. reality без публичного ключа: XrayCore не стартует вовсе («empty password») —
+    //     падает весь конфиг, а не один канал
+    if (stream.security === "reality") {
+      const reality = (stream.realitySettings ?? {}) as Record<string, unknown>;
+      if (!reality.publicKey && !reality.password) {
+        errors.push(`outbound "${o.tag}": reality без publicKey — XrayCore не стартует, весь конфиг мёртв`);
+      }
+    }
     const dialerProxy = ((stream.sockopt ?? {}) as Record<string, unknown>).dialerProxy;
     if (dialerProxy && !outboundTags.has(String(dialerProxy))) {
       errors.push(`outbound "${o.tag}": dialerProxy="${dialerProxy}" не существует — каскад никуда не подключится`);

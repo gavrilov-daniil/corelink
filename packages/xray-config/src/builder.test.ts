@@ -32,6 +32,14 @@ test("assembleBase проходит инвариант-валидатор", () =
   assert.ok(res.ok);
 });
 
+test("reality-канал без pbk валидатор не пропускает: XrayCore клиента не стартует на всём конфиге", () => {
+  const input = fixture();
+  input.channels[0] = { ...input.channels[0]!, host: { ...input.channels[0]!.host, pbk: "" } };
+  const res = validateConfig(assembleBase(input));
+  assert.equal(res.ok, false);
+  assert.ok(res.errors.some((e) => e.includes('"de-direct"') && e.includes("publicKey")), res.errors.join("; "));
+});
+
 test("CDN-канал: клиентский outbound tls + grpc + serviceName, без reality-настроек", () => {
   const input: GeneratorInput = {
     vlessUuid: "11111111-1111-1111-1111-111111111111",

@@ -199,6 +199,14 @@ export class SubscriptionRepository {
 
     return rows
       .filter((r) => r.host)
+      // Reality-ключ приезжает с ноды при энроллменте. До него (и навсегда, если провижн упал)
+      // канал — не «пока не работает», а поломка всей выдачи: на outbound с пустым pbk XrayCore
+      // клиента не стартует вовсе («empty password»), вместе со всеми профилями.
+      .filter((r) => {
+        if ((r.inbound?.security ?? "reality") !== "reality" || r.host!.pbk) return true;
+        this.log.warn(`host «${r.host!.remark}» не выдаётся: нет Reality-ключа — нода ещё не прошла энроллмент`);
+        return false;
+      })
       // канал без привязки к каскаду — обычный direct, его не отсекаем
       .filter((r) => !r.ch.cascadeLinkId || r.link?.status === "active")
       .map(({ ch, host, inbound }) => ({

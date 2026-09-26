@@ -442,6 +442,28 @@ describe("Выдача подписки: что попадает в конфиг
     assert.ok(!res.body.includes("de-direct"));
     assert.ok(res.body.includes("pl-direct"));
   });
+
+  it("локация до энроллмента (нет Reality-ключа) не выдаётся: с пустым pbk у клиента не стартует весь конфиг", async () => {
+    const net = await seedNetwork(db, {
+      channels: [
+        { key: "de", kind: "direct", tag: "de-direct", cc: "DE" },
+        { key: "pl", kind: "direct", tag: "pl-direct", cc: "PL" },
+      ],
+      profiles: [{ remark: "🔀 Авто", isAuto: true, primary: ["de", "pl"] }],
+    });
+    const [de] = await db
+      .select({ hostId: schema.channel.hostId })
+      .from(schema.channel)
+      .where(eq(schema.channel.id, net.channelIdByKey.get("de")!));
+    await db.update(schema.host).set({ pbk: null }).where(eq(schema.host.id, de.hostId!));
+    const sub = await activeSubscription();
+
+    const res = await service.deliverByShortUuid(sub.shortUuid, happ());
+
+    assert.equal(res.kind, "happ", "остальные локации выдаются как обычно");
+    assert.ok(!res.body.includes("de-direct"));
+    assert.ok(res.body.includes("pl-direct"));
+  });
 });
 
 describe("Выдача подписки: HWID-лимит", () => {
