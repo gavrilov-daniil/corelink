@@ -1,6 +1,6 @@
-import { BadRequestException, Inject, Injectable, Logger, NotFoundException } from "@nestjs/common";
+import { BadRequestException, ConflictException, Inject, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { randomBytes, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, gte, inArray, isNotNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, or, sql } from "drizzle-orm";
 import { schema, type Database } from "@corelink/db";
 import { DB } from "../db/db.module.js";
 import { loadConfig } from "../config.js";
@@ -18,18 +18,27 @@ type Selectable = Pick<Database, "select">;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** Потолок ручной выдачи и продления — 10 лет; больше — это «бессрочно», а не опечатка. */
-const MAX_GRANT_DAYS = 3650;
+/** Потолок срока из админки — 10 лет вперёд; дальше — это «бессрочно», а не опечатка. */
+const MAX_TERM_MS = 3650 * 86_400_000;
+
+/**
+ * Срок, заданный оператором точно: момент окончания (ISO) или null — бессрочно.
+ * expectedExpireAt — срок, который форма показала оператору. Разошёлся с базой —
+ * значит, пока форма была открыта, срок сдвинула оплата, и слепая запись затёрла бы
+ * оплаченные дни. Не прислан — без проверки.
+ */
+export interface ExpiryInput {
+  expireAt?: string | null;
+  expectedExpireAt?: string | null;
+}
 
 /**
  * Ручная выдача из админки. Без subscriberId — новый человек без бота (нужна метка).
  * Лимит null — «без лимита»; не прислан — у подписки из бота не трогаем.
  */
-export interface ManualGrantInput {
+export interface ManualGrantInput extends ExpiryInput {
   subscriberId?: string;
   label?: string;
-  /** Срок в днях; null — бессрочно. */
-  days?: number | null;
   deviceLimit?: number | null;
   trafficGb?: number | null;
   /** Свои squad'ы — добавляются к имеющимся; общий у всех и так. */
@@ -37,15 +46,16 @@ export interface ManualGrantInput {
 }
 
 interface Grant {
-  days: number | null;
+  expireAt: Date | null;
+  expected: Date | null | undefined;
   deviceLimit: number | null | undefined;
   trafficGb: number | null | undefined;
   squadIds: string[];
 }
 
 /**
- * Статус после выдачи или продления: блокировку (disabled / suspended) они не снимают —
- * это делает только явное «Включить», иначе продление молча вернуло бы доступ
+ * Статус после выдачи или правки срока: блокировку (disabled / suspended) они не снимают —
+ * это делает только явное «Включить», иначе новый срок молча вернул бы доступ
  * приостановленному за abuse.
  */
 const statusAfterGrant = sql`case when ${schema.subscription.status} in ('disabled', 'suspended')
@@ -480,12 +490,15 @@ export class SubscribersService {
    * его находят в списке. Подписчику из бота доступ выдаётся на ОСНОВНУЮ подписку, а не
    * на вторую: бот показывает клиенту самую раннюю, и вторую ссылку тот бы не увидел.
    *
+   * Срок — точный момент окончания (дата и время из календаря), а не «плюс N дней».
+   *
    * Денег здесь нет — ledger не трогаем. Повтор запроса гасит x-client-request-id на
-   * контроллере: без него дабл-клик завёл бы двух человек или начислил дни дважды.
+   * контроллере: без него дабл-клик завёл бы двух человек.
    */
   async grantManual(input: ManualGrantInput) {
     const grant: Grant = {
-      days: grantDays(input.days, true),
+      expireAt: expiryValue(input.expireAt),
+      expected: expectedValue(input.expectedExpireAt),
       deviceLimit: optionalLimit(input.deviceLimit, "deviceLimit", 100),
       trafficGb: optionalLimit(input.trafficGb, "trafficGb", 100_000),
       squadIds: input.squadIds ?? [],
@@ -526,7 +539,7 @@ export class SubscribersService {
           shortUuid: generateShortUuid(),
           vlessUuid: randomUUID(),
           status: "active",
-          expireAt: grant.days === null ? null : new Date(Date.now() + grant.days * 86_400_000),
+          expireAt: grant.expireAt,
           hwidDeviceLimit: grant.deviceLimit ?? null,
           trafficLimitBytes: grant.trafficGb ? grant.trafficGb * 1024 ** 3 : null,
         })
@@ -549,10 +562,7 @@ export class SubscribersService {
       const [row] = await tx
         .update(schema.subscription)
         .set({
-          expireAt:
-            grant.days === null
-              ? null
-              : sql`greatest(${schema.subscription.expireAt}, now()) + make_interval(days => ${grant.days}::int)`,
+          expireAt: grant.expireAt,
           status: statusAfterGrant,
           ...(grant.deviceLimit !== undefined ? { hwidDeviceLimit: grant.deviceLimit } : {}),
           ...(grant.trafficGb !== undefined
@@ -560,9 +570,9 @@ export class SubscribersService {
             : {}),
           updatedAt: new Date(),
         })
-        .where(and(eq(schema.subscription.id, primary.id), notForever(grant.days)))
+        .where(and(eq(schema.subscription.id, primary.id), expiryUnchanged(grant.expected, grant.expireAt)))
         .returning();
-      if (!row) throw new BadRequestException("подписка бессрочная — дни добавлять некуда");
+      if (!row) throw expiryConflict();
 
       if (grant.squadIds.length > 0) {
         await tx
@@ -575,34 +585,34 @@ export class SubscribersService {
   }
 
   /**
-   * Продление из админки: от текущего окончания, если оно впереди, иначе от сегодня.
-   * Одним UPDATE — без read-modify-write против параллельной оплаты, которая тоже
-   * двигает срок. Бессрочную продлевать некуда.
+   * Срок подписки из карточки: точный момент окончания или бессрочно. Истёкшая и
+   * неактивированная с новым сроком становятся active; блокировку (disabled/suspended)
+   * срок не снимает — это делает только «Включить».
    */
-  async extend(subscriptionId: string, rawDays: unknown) {
+  async setExpiry(subscriptionId: string, input: ExpiryInput) {
     requireUuid(subscriptionId, "id");
-    const days = grantDays(rawDays, false)!;
+    const expireAt = expiryValue(input.expireAt);
+    const expected = expectedValue(input.expectedExpireAt);
     await this.getSubscription(subscriptionId);
 
     const [row] = await this.db
       .update(schema.subscription)
-      .set({
-        expireAt: sql`greatest(${schema.subscription.expireAt}, now()) + make_interval(days => ${days}::int)`,
-        status: statusAfterGrant,
-        updatedAt: new Date(),
-      })
+      .set({ expireAt, status: statusAfterGrant, updatedAt: new Date() })
       .where(
         and(
           eq(schema.subscription.orgId, this.cfg.defaultOrgId),
           eq(schema.subscription.id, subscriptionId),
-          notForever(days),
+          expiryUnchanged(expected, expireAt),
         ),
       )
       .returning();
-    if (!row) throw new BadRequestException("подписка бессрочная — продлевать некуда");
+    if (!row) throw expiryConflict();
 
     const rebuild = await this.nodes.rebuildAll();
-    this.log.log(`подписка ${subscriptionId}: продлена на ${days} дн до ${row.expireAt?.toISOString()}, нод пересобрано ${rebuild.changed.length}`);
+    this.log.log(
+      `подписка ${subscriptionId}: срок из админки — ${expireAt?.toISOString() ?? "бессрочно"}, ` +
+        `нод пересобрано ${rebuild.changed.length}`,
+    );
     return { subscriptionId, status: row.status, expireAt: row.expireAt };
   }
 
@@ -675,13 +685,45 @@ function requireUuid(value: unknown, field: string): string {
   return value;
 }
 
-/** Срок выдачи в днях. null — бессрочно, если это допустимо (при продлении — нет). */
-function grantDays(value: unknown, allowForever: boolean): number | null {
-  if (value === null && allowForever) return null;
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > MAX_GRANT_DAYS) {
-    throw new BadRequestException(`days: целое 1..${MAX_GRANT_DAYS}${allowForever ? " или null (бессрочно)" : ""}`);
+/** Момент окончания из календаря: в будущем и не дальше 10 лет. null — бессрочно. */
+function expiryValue(value: unknown): Date | null {
+  if (value === null) return null;
+  const date = typeof value === "string" ? new Date(value) : null;
+  if (!date || Number.isNaN(date.getTime())) {
+    throw new BadRequestException("expireAt: дата окончания (ISO) или null — бессрочно");
   }
-  return value;
+  if (date.getTime() <= Date.now()) throw new BadRequestException("expireAt: дата окончания уже прошла");
+  if (date.getTime() > Date.now() + MAX_TERM_MS) {
+    throw new BadRequestException("expireAt: дальше 10 лет — выберите «бессрочно»");
+  }
+  return date;
+}
+
+function expectedValue(value: unknown): Date | null | undefined {
+  if (value === undefined || value === null) return value;
+  const date = typeof value === "string" ? new Date(value) : null;
+  if (!date || Number.isNaN(date.getTime())) throw new BadRequestException("expectedExpireAt: ISO-дата или null");
+  return date;
+}
+
+/**
+ * Срок в базе всё ещё тот, что видел оператор, — или уже ровно тот, что он ставит:
+ * повтор того же запроса не конфликт. Сравнение до миллисекунд: в JS-дате микросекунд
+ * нет, и строгое равенство с timestamptz ругалось бы на неизменённый срок.
+ */
+function expiryUnchanged(expected: Date | null | undefined, requested: Date | null) {
+  if (expected === undefined) return undefined;
+  return or(sameExpiry(expected), sameExpiry(requested));
+}
+
+function sameExpiry(value: Date | null) {
+  if (value === null) return isNull(schema.subscription.expireAt);
+  return sql`date_trunc('milliseconds', ${schema.subscription.expireAt})
+    = date_trunc('milliseconds', ${value.toISOString()}::timestamptz)`;
+}
+
+function expiryConflict(): ConflictException {
+  return new ConflictException("срок подписки изменился, пока была открыта форма (например, прошла оплата) — обновите и проверьте");
 }
 
 /** Лимит: целое 1..max, null — без лимита, не прислан — не трогать. */
@@ -700,13 +742,4 @@ function manualLabel(value: unknown): string {
     throw new BadRequestException("label: кто это — обязательная метка до 128 символов");
   }
   return label;
-}
-
-/**
- * Дни добавляются только к подписке со сроком. expire_at IS NULL у неактивированной
- * (inactive) — это «ещё не выдавали», а у остальных — бессрочная: к ней дни не прибавить.
- */
-function notForever(days: number | null) {
-  if (days === null) return undefined;
-  return or(isNotNull(schema.subscription.expireAt), eq(schema.subscription.status, "inactive"));
 }

@@ -2,14 +2,15 @@
  * Ручная выдача из админки — без оплаты и без бота.
  *
  * Инварианты: подписчику из бота доступ ложится на его основную подписку (вторую бот
- * не показал бы); срок считается от текущего окончания; блокировку выдача и продление
- * не снимают; выданный доступ сразу доезжает до нод; повтор запроса ничего не двоит.
+ * не показал бы); срок — ровно тот момент, что выбран в календаре; срок, сдвинутый
+ * оплатой, пока форма была открыта, не затирается; блокировку новый срок не снимает;
+ * выданный доступ сразу доезжает до нод; повтор запроса ничего не двоит.
  */
 import "reflect-metadata";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { after, before, beforeEach, describe, it } from "node:test";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { schema, type Database } from "@corelink/db";
 import {
   TEST_ORG_ID,
@@ -59,19 +60,22 @@ async function subscriptionRow(id: string) {
   return row;
 }
 
-/** Целых дней от сейчас до даты: доли дня уходят на время самого теста. */
-function daysFromNow(date: Date | null): number {
-  return Math.round(((date?.getTime() ?? 0) - Date.now()) / DAY_MS);
+/** Момент через n дней с точностью до минуты — ровно так его отдаёт календарь. */
+function inDays(n: number): string {
+  const d = new Date(Date.now() + n * DAY_MS);
+  d.setSeconds(0, 0);
+  return d.toISOString();
 }
 
 describe("ручная выдача: новый человек без бота", () => {
-  it("заводит подписчика без Telegram с меткой и активную подписку на срок", async () => {
-    const res = await service.grantManual({ label: "Тестер Вася", days: 30, deviceLimit: 3, trafficGb: 50 });
+  it("заводит подписчика без Telegram с меткой и активную подписку до выбранного момента", async () => {
+    const until = inDays(30);
+    const res = await service.grantManual({ label: "Тестер Вася", expireAt: until, deviceLimit: 3, trafficGb: 50 });
 
     assert.match(res.subscriptionUrl, /\/auto\/[0-9a-f]{24}$/);
     const sub = await subscriptionRow(res.subscriptionId);
     assert.equal(sub.status, "active");
-    assert.equal(daysFromNow(sub.expireAt), 30);
+    assert.equal(sub.expireAt?.toISOString(), until, "срок — ровно выбранные дата и время");
     assert.equal(sub.hwidDeviceLimit, 3);
     assert.equal(sub.trafficLimitBytes, 50 * 1024 ** 3);
 
@@ -81,7 +85,7 @@ describe("ручная выдача: новый человек без бота",
   });
 
   it("бессрочно и без лимитов: срока нет, лимиты пустые", async () => {
-    const res = await service.grantManual({ label: "Служебный", days: null });
+    const res = await service.grantManual({ label: "Служебный", expireAt: null });
     const sub = await subscriptionRow(res.subscriptionId);
 
     assert.equal(sub.expireAt, null);
@@ -91,7 +95,7 @@ describe("ручная выдача: новый человек без бота",
 
   it("свои squad'ы ложатся явным членством; несуществующий — 400, и человек не заводится", async () => {
     const premium = await createSquad(db, "Премиум");
-    const res = await service.grantManual({ label: "VIP", days: 30, squadIds: [premium.id] });
+    const res = await service.grantManual({ label: "VIP", expireAt: inDays(30), squadIds: [premium.id] });
     const links = await db
       .select()
       .from(schema.subscriptionSquad)
@@ -102,7 +106,12 @@ describe("ручная выдача: новый человек без бота",
     );
 
     await assert.rejects(
-      () => service.grantManual({ label: "Лишний", days: 30, squadIds: ["11111111-1111-1111-1111-111111111111"] }),
+      () =>
+        service.grantManual({
+          label: "Лишний",
+          expireAt: inDays(30),
+          squadIds: ["11111111-1111-1111-1111-111111111111"],
+        }),
       (e) => status(e) === 400,
     );
     const ghosts = await db
@@ -112,19 +121,22 @@ describe("ручная выдача: новый человек без бота",
     assert.equal(ghosts.length, 0);
   });
 
-  it("без метки, без срока и с нулевым сроком — 400", async () => {
-    await assert.rejects(() => service.grantManual({ days: 30 }), (e) => status(e) === 400);
+  it("без метки, без срока, с прошедшей датой, дальше 10 лет и с мусором вместо даты — 400", async () => {
+    await assert.rejects(() => service.grantManual({ expireAt: inDays(30) }), (e) => status(e) === 400);
     await assert.rejects(() => service.grantManual({ label: "Кто-то" }), (e) => status(e) === 400);
-    await assert.rejects(() => service.grantManual({ label: "Кто-то", days: 0 }), (e) => status(e) === 400);
+    await assert.rejects(() => service.grantManual({ label: "Кто-то", expireAt: inDays(-1) }), (e) => status(e) === 400);
+    await assert.rejects(() => service.grantManual({ label: "Кто-то", expireAt: inDays(3651) }), (e) => status(e) === 400);
+    await assert.rejects(() => service.grantManual({ label: "Кто-то", expireAt: "завтра" }), (e) => status(e) === 400);
   });
 });
 
 describe("ручная выдача: подписчику из бота", () => {
-  it("ложится на основную подписку: вторая не заводится, ссылка та же, что в боте", async () => {
+  it("ложится на основную подписку: вторая не заводится, ссылка та же, срок — ровно выбранный", async () => {
     const person = await createSubscriber(db);
     const primary = await service.ensureSubscription(person.id); // inactive — как после /start
+    const until = inDays(14);
 
-    const res = await service.grantManual({ subscriberId: person.id, days: 14 });
+    const res = await service.grantManual({ subscriberId: person.id, expireAt: until, expectedExpireAt: null });
 
     assert.equal(res.subscriptionId, primary.id);
     assert.ok(res.subscriptionUrl.endsWith(`/auto/${primary.shortUuid}`));
@@ -132,70 +144,97 @@ describe("ручная выдача: подписчику из бота", () => 
     assert.equal(all.length, 1);
     const sub = await subscriptionRow(primary.id);
     assert.equal(sub.status, "active");
-    assert.equal(daysFromNow(sub.expireAt), 14);
+    assert.equal(sub.expireAt?.toISOString(), until);
   });
 
-  it("срок прибавляется к текущему окончанию, а лимит без поля не трогается", async () => {
+  it("срок, сдвинутый оплатой, пока форма была открыта, — 409, а не затирание оплаченных дней", async () => {
     const person = await createSubscriber(db);
-    const sub = await createSubscription(db, person.id, {
-      expireAt: new Date(Date.now() + 10 * DAY_MS),
-      hwidDeviceLimit: 2,
-    });
+    const paidUntil = new Date(inDays(40)); // оплата продлила, пока оператор смотрел на старый срок
+    const sub = await createSubscription(db, person.id, { expireAt: paidUntil });
 
-    await service.grantManual({ subscriberId: person.id, days: 30 });
+    await assert.rejects(
+      () => service.grantManual({ subscriberId: person.id, expireAt: inDays(20), expectedExpireAt: inDays(10) }),
+      (e) => status(e) === 409,
+    );
+    assert.equal((await subscriptionRow(sub.id)).expireAt?.toISOString(), paidUntil.toISOString());
+  });
+
+  it("лимит без поля не трогается; повтор того же запроса — не конфликт", async () => {
+    const person = await createSubscriber(db);
+    const seen = inDays(10);
+    const sub = await createSubscription(db, person.id, { expireAt: new Date(seen), hwidDeviceLimit: 2 });
+    const body = { subscriberId: person.id, expireAt: inDays(40), expectedExpireAt: seen };
+
+    await service.grantManual(body);
+    await service.grantManual(body);
 
     const granted = await subscriptionRow(sub.id);
-    assert.equal(daysFromNow(granted.expireAt), 40);
+    assert.equal(granted.expireAt?.toISOString(), body.expireAt);
     assert.equal(granted.hwidDeviceLimit, 2);
   });
 
-  it("бессрочной дни не прибавить — 400; неизвестный подписчик — 404", async () => {
-    const person = await createSubscriber(db);
-    await createSubscription(db, person.id); // active без срока — бессрочная
-
-    await assert.rejects(() => service.grantManual({ subscriberId: person.id, days: 30 }), (e) => status(e) === 400);
+  it("неизвестный подписчик — 404", async () => {
     await assert.rejects(
-      () => service.grantManual({ subscriberId: "11111111-1111-1111-1111-111111111111", days: 30 }),
+      () => service.grantManual({ subscriberId: "11111111-1111-1111-1111-111111111111", expireAt: inDays(30) }),
       (e) => status(e) === 404,
     );
   });
 });
 
-describe("продление и отключение", () => {
-  it("истёкшая продлевается от сегодня и снова active", async () => {
-    const sub = await createSubscription(db, (await createSubscriber(db)).id, {
-      status: "expired",
-      expireAt: new Date(Date.now() - 5 * DAY_MS),
-    });
+describe("срок из карточки и отключение", () => {
+  it("истёкшая с новым сроком снова active", async () => {
+    const expiredAt = new Date(inDays(-5));
+    const sub = await createSubscription(db, (await createSubscriber(db)).id, { status: "expired", expireAt: expiredAt });
+    const until = inDays(30);
 
-    const res = await service.extend(sub.id, 30);
+    const res = await service.setExpiry(sub.id, { expireAt: until, expectedExpireAt: expiredAt.toISOString() });
 
     assert.equal(res.status, "active");
-    assert.equal(daysFromNow(res.expireAt), 30);
+    assert.equal(res.expireAt?.toISOString(), until);
   });
 
-  it("продление не снимает блокировку: отключённая остаётся disabled", async () => {
-    const sub = await createSubscription(db, (await createSubscriber(db)).id, {
-      status: "disabled",
-      expireAt: new Date(Date.now() + 5 * DAY_MS),
-    });
+  it("новый срок не снимает блокировку: отключённая остаётся disabled", async () => {
+    const seen = new Date(inDays(5));
+    const sub = await createSubscription(db, (await createSubscriber(db)).id, { status: "disabled", expireAt: seen });
 
-    const res = await service.extend(sub.id, 10);
+    const res = await service.setExpiry(sub.id, { expireAt: inDays(15), expectedExpireAt: seen.toISOString() });
 
     assert.equal(res.status, "disabled");
-    assert.equal(daysFromNow(res.expireAt), 15);
   });
 
-  it("продление бессрочной и продление без срока — 400", async () => {
-    const forever = await createSubscription(db, (await createSubscriber(db)).id);
-    await assert.rejects(() => service.extend(forever.id, 30), (e) => status(e) === 400);
-    await assert.rejects(() => service.extend(forever.id, undefined), (e) => status(e) === 400);
+  it("бессрочную можно ограничить датой и вернуть в бессрочную", async () => {
+    const sub = await createSubscription(db, (await createSubscriber(db)).id); // active без срока
+    const until = inDays(10);
+
+    await service.setExpiry(sub.id, { expireAt: until, expectedExpireAt: null });
+    assert.equal((await subscriptionRow(sub.id)).expireAt?.toISOString(), until);
+
+    await service.setExpiry(sub.id, { expireAt: null, expectedExpireAt: until });
+    assert.equal((await subscriptionRow(sub.id)).expireAt, null);
+  });
+
+  it("срок сдвинулся, пока карточка была открыта, — 409; без срока в запросе — 400", async () => {
+    const sub = await createSubscription(db, (await createSubscriber(db)).id, { expireAt: new Date(inDays(40)) });
+
+    await assert.rejects(
+      () => service.setExpiry(sub.id, { expireAt: inDays(20), expectedExpireAt: inDays(10) }),
+      (e) => status(e) === 409,
+    );
+    await assert.rejects(() => service.setExpiry(sub.id, {}), (e) => status(e) === 400);
+  });
+
+  it("сверка срока не спотыкается о микросекунды в базе", async () => {
+    const sub = await createSubscription(db, (await createSubscriber(db)).id);
+    // срок с микросекундами — так его пишет SQL-арифметика; в JS-дате их нет
+    await db.execute(sql`update subscription set expire_at = now() + interval '5 days' where id = ${sub.id}`);
+    const seen = (await subscriptionRow(sub.id)).expireAt!.toISOString();
+
+    const res = await service.setExpiry(sub.id, { expireAt: inDays(30), expectedExpireAt: seen });
+    assert.equal(res.subscriptionId, sub.id);
   });
 
   it("отключить → disabled, включить → active; повтор ничего не меняет", async () => {
-    const sub = await createSubscription(db, (await createSubscriber(db)).id, {
-      expireAt: new Date(Date.now() + 5 * DAY_MS),
-    });
+    const sub = await createSubscription(db, (await createSubscriber(db)).id, { expireAt: new Date(inDays(5)) });
 
     assert.deepEqual(await service.setEnabled(sub.id, false), { subscriptionId: sub.id, status: "disabled", changed: true });
     assert.equal((await service.setEnabled(sub.id, false)).changed, false);
@@ -205,7 +244,7 @@ describe("продление и отключение", () => {
   it("включение истёкшей по сроку даёт expired, а не active", async () => {
     const sub = await createSubscription(db, (await createSubscriber(db)).id, {
       status: "disabled",
-      expireAt: new Date(Date.now() - DAY_MS),
+      expireAt: new Date(inDays(-1)),
     });
     assert.equal((await service.setEnabled(sub.id, true)).status, "expired");
   });
@@ -213,7 +252,7 @@ describe("продление и отключение", () => {
   it("включение снимает приостановку за abuse (suspended)", async () => {
     const sub = await createSubscription(db, (await createSubscriber(db)).id, {
       status: "suspended",
-      expireAt: new Date(Date.now() + 5 * DAY_MS),
+      expireAt: new Date(inDays(5)),
     });
     assert.equal((await service.setEnabled(sub.id, true)).status, "active");
   });
@@ -235,7 +274,7 @@ describe("выданный доступ сразу на нодах", () => {
       country: "DE",
     });
 
-    const res = await service.grantManual({ label: "Друг", days: 7 });
+    const res = await service.grantManual({ label: "Друг", expireAt: inDays(7) });
     const sub = await subscriptionRow(res.subscriptionId);
     const users = (await state.getDesiredState(loc.node.id)).users;
     assert.ok(users.some((u) => u.uuid === sub.vlessUuid), "без ожидания пересборки по расписанию");
@@ -246,13 +285,14 @@ describe("выданный доступ сразу на нодах", () => {
   });
 });
 
-describe("повтор запроса (x-client-request-id)", () => {
-  it("дабл-клик создания не заводит второго человека", async () => {
+describe("повтор запроса", () => {
+  it("дабл-клик создания (тот же x-client-request-id) не заводит второго человека", async () => {
     const controller = new SubscribersController(service, new IdempotencyService());
     const requestId = randomUUID();
+    const body = { label: "Дубль", expireAt: inDays(30) };
 
-    const first = await controller.grantManual({ label: "Дубль", days: 30 }, requestId);
-    const second = await controller.grantManual({ label: "Дубль", days: 30 }, requestId);
+    const first = await controller.grantManual(body, requestId);
+    const second = await controller.grantManual(body, requestId);
 
     assert.equal(second.subscriptionId, first.subscriptionId);
     const people = await db
@@ -262,16 +302,15 @@ describe("повтор запроса (x-client-request-id)", () => {
     assert.equal(people.length, 1);
   });
 
-  it("повтор продления с тем же ключом не добавляет дни второй раз", async () => {
+  it("повтор установки того же срока — не конфликт и не сдвиг", async () => {
     const controller = new SubscribersController(service, new IdempotencyService());
-    const sub = await createSubscription(db, (await createSubscriber(db)).id, {
-      expireAt: new Date(Date.now() + DAY_MS),
-    });
-    const requestId = randomUUID();
+    const seen = inDays(1);
+    const sub = await createSubscription(db, (await createSubscriber(db)).id, { expireAt: new Date(seen) });
+    const body = { expireAt: inDays(31), expectedExpireAt: seen };
 
-    await controller.extend(sub.id, { days: 30 }, requestId);
-    await controller.extend(sub.id, { days: 30 }, requestId);
+    await controller.setExpiry(sub.id, body);
+    await controller.setExpiry(sub.id, body);
 
-    assert.equal(daysFromNow((await subscriptionRow(sub.id)).expireAt), 31);
+    assert.equal((await subscriptionRow(sub.id)).expireAt?.toISOString(), body.expireAt);
   });
 });

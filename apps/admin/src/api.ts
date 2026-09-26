@@ -728,6 +728,7 @@ export interface Subscriber {
   label: string | null;
   status: string;
   expireAt: string | null;
+  createdAt: string;
   usedTrafficBytes: number;
   /** null — без лимита. */
   trafficLimitBytes: number | null;
@@ -778,13 +779,21 @@ export const revokeSubscription = (subscriptionId: string) =>
   request<RevokeResult>(`/api/admin/subscriptions/${subscriptionId}/revoke`, { method: "POST" });
 
 /**
- * Ручная выдача. Без subscriberId — новый человек без бота (нужна метка). days: null — бессрочно;
- * лимит null — без лимита. requestId — один на открытую форму: повтор не заведёт второго человека.
+ * Точный срок: момент окончания (ISO) или null — бессрочно. expectedExpireAt — срок, который
+ * видела форма: если его успела сдвинуть оплата, сервер ответит 409, а не затрёт оплаченные дни.
  */
-export interface ManualGrantInput {
+export interface ExpiryInput {
+  expireAt: string | null;
+  expectedExpireAt?: string | null;
+}
+
+/**
+ * Ручная выдача. Без subscriberId — новый человек без бота (нужна метка). Лимит null — без
+ * лимита. requestId — один на открытую форму: повтор не заведёт второго человека.
+ */
+export interface ManualGrantInput extends ExpiryInput {
   subscriberId?: string;
   label?: string;
-  days: number | null;
   deviceLimit?: number | null;
   trafficGb?: number | null;
   squadIds?: string[];
@@ -804,11 +813,11 @@ export const grantManualSubscription = (body: ManualGrantInput, requestId: strin
     headers: { "content-type": "application/json", "x-client-request-id": requestId },
   });
 
-/** Продление: от текущего окончания, если оно впереди, иначе от сегодня. */
-export const extendSubscription = (subscriptionId: string, days: number, requestId: string) =>
+/** Точный срок подписки (дата и время) или бессрочно. Блокировку не снимает — только «Включить». */
+export const setSubscriptionExpiry = (subscriptionId: string, body: ExpiryInput) =>
   request<{ subscriptionId: string; status: string; expireAt: string | null }>(
-    `/api/admin/subscriptions/${subscriptionId}/extend`,
-    { ...post({ days }), headers: { "content-type": "application/json", "x-client-request-id": requestId } },
+    `/api/admin/subscriptions/${subscriptionId}/expiry`,
+    post(body),
   );
 
 /** Отключить (disabled) или включить (снимает disabled и suspended). Повтор ничего не меняет. */

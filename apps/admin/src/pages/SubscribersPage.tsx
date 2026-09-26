@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import {
   errorMessage,
-  extendSubscription,
   getDevices,
   getSquads,
   getSubscribers,
@@ -9,6 +8,7 @@ import {
   grantManualSubscription,
   revokeSubscription,
   setSubscriptionEnabled,
+  setSubscriptionExpiry,
   unlinkDevice,
   type ManualGrantResult,
   type Subscriber,
@@ -32,6 +32,103 @@ import Loading from "../components/Loading";
 function displayName(s: Subscriber): string {
   if (s.username) return `@${s.username}`;
   return s.label ?? "без username";
+}
+
+/** Значение для <input type="datetime-local">: локальное время браузера, «YYYY-MM-DDTHH:mm». */
+function toLocalInput(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+/** Часовой пояс браузера: календарь показывает локальное время, серверу уходит UTC. */
+const TIME_ZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+/** Календарные дни и год — как ждёт человек, а не «365×24 часа». */
+const EXPIRY_PRESETS: Array<{ label: string; apply: (d: Date) => void }> = [
+  { label: "+7 дн", apply: (d) => d.setDate(d.getDate() + 7) },
+  { label: "+30 дн", apply: (d) => d.setDate(d.getDate() + 30) },
+  { label: "+90 дн", apply: (d) => d.setDate(d.getDate() + 90) },
+  { label: "+1 год", apply: (d) => d.setFullYear(d.getFullYear() + 1) },
+];
+
+/** От чего считать пресеты: от текущего окончания, если оно впереди, иначе от сейчас. */
+function expiryBase(expireAt: string | null): Date {
+  const current = expireAt ? new Date(expireAt) : null;
+  return current && current.getTime() > Date.now() ? current : new Date();
+}
+
+function plusDays(base: Date, days: number): Date {
+  const d = new Date(base);
+  d.setDate(d.getDate() + days);
+  return d;
+}
+
+/**
+ * Срок из календаря: момент окончания или «бессрочно». Возвращает ISO для сервера либо
+ * текст ошибки — пустое и прошедшее время до сервера не доходит.
+ */
+function expiryPayload(value: string, forever: boolean): { expireAt: string | null } | { error: string } {
+  if (forever) return { expireAt: null };
+  const date = new Date(value); // «YYYY-MM-DDTHH:mm» без пояса JS читает как локальное время
+  if (!value || Number.isNaN(date.getTime())) return { error: "выберите дату и время окончания" };
+  if (date.getTime() <= Date.now()) return { error: "дата окончания уже прошла" };
+  return { expireAt: date.toISOString() };
+}
+
+function ExpiryPicker({
+  value,
+  forever,
+  base,
+  onChange,
+  onForever,
+}: {
+  value: string;
+  forever: boolean;
+  /** От чего считают пресеты. */
+  base: Date;
+  onChange: (value: string) => void;
+  onForever: (forever: boolean) => void;
+}) {
+  return (
+    <>
+      <div className="grid-2">
+        <Field label="Действует до" hint={`дата и время окончания · ${TIME_ZONE}`}>
+          <input
+            type="datetime-local"
+            value={value}
+            min={toLocalInput(new Date())}
+            disabled={forever}
+            onChange={(e) => onChange(e.target.value)}
+          />
+        </Field>
+        <Field label="Без срока">
+          <label className="check">
+            <input type="checkbox" checked={forever} onChange={(e) => onForever(e.target.checked)} />
+            <span>бессрочно</span>
+          </label>
+        </Field>
+      </div>
+      {!forever && (
+        <div className="expiry-presets">
+          {EXPIRY_PRESETS.map((p) => (
+            <button
+              key={p.label}
+              type="button"
+              className="btn btn-sm"
+              onClick={() => {
+                const d = new Date(base);
+                p.apply(d);
+                onChange(toLocalInput(d));
+              }}
+            >
+              {p.label}
+            </button>
+          ))}
+          <span className="muted small">от {formatDateTime(base.toISOString())}</span>
+        </div>
+      )}
+    </>
+  );
 }
 
 export default function SubscribersPage() {
@@ -212,7 +309,7 @@ function ManualGrantModal({
   const [label, setLabel] = useState("");
   const [filter, setFilter] = useState("");
   const [subscriberId, setSubscriberId] = useState("");
-  const [days, setDays] = useState("30");
+  const [until, setUntil] = useState(() => toLocalInput(plusDays(new Date(), 30)));
   const [forever, setForever] = useState(false);
   const [deviceLimit, setDeviceLimit] = useState("");
   const [trafficGb, setTrafficGb] = useState("");
@@ -221,10 +318,17 @@ function ManualGrantModal({
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ManualGrantResult | null>(null);
 
-  // по строке на человека из бота: выдача ляжет на его основную подписку
-  const botPeople = [
-    ...new Map(subscribers.filter((s) => s.telegramId !== null).map((s) => [s.subscriberId, s])).values(),
-  ];
+  // По строке на человека из бота — его основная (самая ранняя) подписка: на неё ляжет
+  // выдача, её срок форма показывает и сверяет с базой.
+  const primaryBySubscriber = new Map<string, Subscriber>();
+  for (const s of subscribers) {
+    if (s.telegramId === null) continue;
+    const known = primaryBySubscriber.get(s.subscriberId);
+    if (!known || s.createdAt < known.createdAt) primaryBySubscriber.set(s.subscriberId, s);
+  }
+  const botPeople = [...primaryBySubscriber.values()];
+  const chosen = target === "bot" ? primaryBySubscriber.get(subscriberId) : undefined;
+  const base = expiryBase(chosen?.expireAt ?? null);
   const needle = filter.trim().toLowerCase();
   const options = botPeople
     .filter((s) => !needle || (s.username ?? "").toLowerCase().includes(needle) || String(s.telegramId).includes(needle))
@@ -232,8 +336,10 @@ function ManualGrantModal({
 
   const pick = (id: string) => {
     setSubscriberId(id);
-    // лимиты подставляем текущие: что в форме — то и будет у подписки
-    const row = botPeople.find((s) => s.subscriberId === id);
+    // срок и лимиты подставляем от текущих: что в форме — то и будет у подписки
+    const row = primaryBySubscriber.get(id);
+    setForever(Boolean(row && row.expireAt === null && row.status !== "inactive"));
+    setUntil(toLocalInput(plusDays(expiryBase(row?.expireAt ?? null), 30)));
     setDeviceLimit(row?.deviceLimit ? String(row.deviceLimit) : "");
     setTrafficGb(row?.trafficLimitBytes ? String(Math.round(row.trafficLimitBytes / 1024 ** 3)) : "");
   };
@@ -242,11 +348,11 @@ function ManualGrantModal({
     setSquadIds((prev) => (on ? [...new Set([...prev, id])] : prev.filter((x) => x !== id)));
 
   const submit = async () => {
-    const term = Number(days);
+    const expiry = expiryPayload(until, forever);
     const devices = parseLimit(deviceLimit);
     const traffic = parseLimit(trafficGb);
-    // NaN ушёл бы в JSON как null — сервер принял бы его за «бессрочно»/«без лимита»
-    if (!forever && (!Number.isInteger(term) || term < 1)) return setError("срок — целое число дней");
+    // NaN ушёл бы в JSON как null — сервер принял бы его за «без лимита»
+    if ("error" in expiry) return setError(expiry.error);
     if (devices === undefined) return setError("устройств — целое число или пусто");
     if (traffic === undefined) return setError("трафик — целое число ГБ или пусто");
 
@@ -255,8 +361,10 @@ function ManualGrantModal({
     try {
       const res = await grantManualSubscription(
         {
-          ...(target === "new" ? { label: label.trim() } : { subscriberId }),
-          days: forever ? null : term,
+          ...(target === "new"
+            ? { label: label.trim() }
+            : { subscriberId, expectedExpireAt: chosen?.expireAt ?? null }),
+          expireAt: expiry.expireAt,
           deviceLimit: devices,
           trafficGb: traffic,
           squadIds,
@@ -360,17 +468,13 @@ function ManualGrantModal({
         </>
       )}
 
-      <div className="grid-2">
-        <Field label="Срок, дней" hint={target === "bot" ? "прибавится к текущему окончанию" : undefined}>
-          <input value={days} onChange={(e) => setDays(e.target.value)} inputMode="numeric" disabled={forever} />
-        </Field>
-        <Field label="Без срока">
-          <label className="check">
-            <input type="checkbox" checked={forever} onChange={(e) => setForever(e.target.checked)} />
-            <span>бессрочно</span>
-          </label>
-        </Field>
-      </div>
+      {chosen && (
+        <p className="muted small">
+          Сейчас: {chosen.expireAt ? `до ${formatDateTime(chosen.expireAt)}` : "без срока"} ·{" "}
+          <StatusBadge status={chosen.status} />
+        </p>
+      )}
+      <ExpiryPicker value={until} forever={forever} base={base} onChange={setUntil} onForever={setForever} />
       <div className="grid-2">
         <Field label="Лимит устройств" hint="пусто — без лимита">
           <input value={deviceLimit} onChange={(e) => setDeviceLimit(e.target.value)} inputMode="numeric" />
@@ -509,20 +613,18 @@ const CAN_DISABLE = ["active", "trial", "suspended", "expired"];
 const CAN_ENABLE = ["disabled", "suspended"];
 
 /**
- * Срок и доступ: продление на N дней и отключение/включение. Включение снимает и
- * приостановку за abuse (suspended). Продление блокировку не снимает — только «Включить».
+ * Срок и доступ: точный срок (дата и время) или бессрочно, и отключение/включение.
+ * Включение снимает и приостановку за abuse (suspended); новый срок блокировку не снимает.
+ * Форма отправляет срок, который показала: сдвинула его оплата — сервер ответит 409.
  */
 function AccessBlock({ subscriber, onChanged }: { subscriber: Subscriber; onChanged: () => void }) {
   const canEdit = useCan("admin");
-  const [days, setDays] = useState("30");
-  // ключ продления живёт до успеха: дабл-клик уйдёт с тем же ключом и дни не задвоит
-  const [requestId, setRequestId] = useState(() => crypto.randomUUID());
+  const [until, setUntil] = useState(() => toLocalInput(plusDays(expiryBase(subscriber.expireAt), 30)));
+  const [forever, setForever] = useState(subscriber.expireAt === null && subscriber.status !== "inactive");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   if (!canEdit) return null;
-
-  const forever = subscriber.expireAt === null && subscriber.status !== "inactive";
 
   const run = async (action: () => Promise<unknown>) => {
     setBusy(true);
@@ -537,32 +639,29 @@ function AccessBlock({ subscriber, onChanged }: { subscriber: Subscriber; onChan
     }
   };
 
-  const extend = () => {
-    const term = Number(days);
-    if (!Number.isInteger(term) || term < 1) return setError("срок — целое число дней");
-    void run(async () => {
-      await extendSubscription(subscriber.id, term, requestId);
-      setRequestId(crypto.randomUUID());
-    });
+  const saveExpiry = () => {
+    const expiry = expiryPayload(until, forever);
+    if ("error" in expiry) return setError(expiry.error);
+    void run(() =>
+      setSubscriptionExpiry(subscriber.id, { expireAt: expiry.expireAt, expectedExpireAt: subscriber.expireAt }),
+    );
   };
 
   return (
     <>
       <h3 className="form-section">Срок и доступ</h3>
       {error && <ErrorBox error={error} />}
+      <ExpiryPicker
+        value={until}
+        forever={forever}
+        base={expiryBase(subscriber.expireAt)}
+        onChange={setUntil}
+        onForever={setForever}
+      />
       <div className="inline-form">
-        {forever ? (
-          <span className="small">Бессрочная — продлевать некуда.</span>
-        ) : (
-          <>
-            <Field label="Продлить на, дней" hint="от текущего окончания, если оно впереди">
-              <input value={days} onChange={(e) => setDays(e.target.value)} inputMode="numeric" />
-            </Field>
-            <button type="button" className="btn" onClick={extend} disabled={busy}>
-              Продлить
-            </button>
-          </>
-        )}
+        <button type="button" className="btn btn-primary" onClick={saveExpiry} disabled={busy}>
+          Сохранить срок
+        </button>
         {CAN_DISABLE.includes(subscriber.status) && (
           <button
             type="button"

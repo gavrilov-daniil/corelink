@@ -1,7 +1,7 @@
 import { Body, Controller, Delete, Get, Headers, Param, Patch, Post } from "@nestjs/common";
 import { MinRole } from "../auth/roles.js";
 import { IdempotencyService } from "../common/idempotency.service.js";
-import { SubscribersService, type ManualGrantInput } from "./subscribers.service.js";
+import { SubscribersService, type ExpiryInput, type ManualGrantInput } from "./subscribers.service.js";
 
 @Controller()
 export class SubscribersController {
@@ -63,22 +63,20 @@ export class SubscribersController {
 
   /**
    * Ручная выдача: новому человеку без бота или подписчику из бота. Идемпотентно по
-   * x-client-request-id: дабл-клик не заведёт второго человека и не начислит дни дважды.
+   * x-client-request-id: дабл-клик не заведёт второго человека.
    */
   @Post("api/admin/subscriptions/manual")
   grantManual(@Body() body: ManualGrantInput, @Headers("x-client-request-id") clientRequestId?: string) {
     return this.idempotency.run("subscription-manual", clientRequestId, () => this.subscribers.grantManual(body ?? {}));
   }
 
-  @Post("api/admin/subscriptions/:id/extend")
-  extend(
-    @Param("id") id: string,
-    @Body() body: { days?: unknown },
-    @Headers("x-client-request-id") clientRequestId?: string,
-  ) {
-    return this.idempotency.run(`subscription-extend:${id}`, clientRequestId, () =>
-      this.subscribers.extend(id, body?.days),
-    );
+  /**
+   * Точный срок (дата и время) или бессрочно. Идемпотентно без ключа: повтор ставит то же
+   * значение, а expectedExpireAt ловит срок, сдвинутый оплатой, пока форма была открыта.
+   */
+  @Post("api/admin/subscriptions/:id/expiry")
+  setExpiry(@Param("id") id: string, @Body() body: ExpiryInput) {
+    return this.subscribers.setExpiry(id, body ?? {});
   }
 
   /** Отключение и включение идемпотентны сами: повтор статус не меняет. */

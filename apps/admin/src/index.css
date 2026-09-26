@@ -456,6 +456,15 @@ select {
   margin-bottom: 0;
 }
 
+/* Быстрые сроки под календарём: +7 дн, +30 дн… */
+.expiry-presets {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--cl-space-2);
+  margin-bottom: var(--cl-space-3);
+}
+
 /* --- Переключатель --- */
 
 .toggle {
