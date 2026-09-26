@@ -12,6 +12,7 @@ export const JOB_NAMES = [
   "maintenance",
   "provision-resume",
   "node-probe",
+  "traffic-detect",
 ] as const;
 
 export type JobName = (typeof JOB_NAMES)[number];

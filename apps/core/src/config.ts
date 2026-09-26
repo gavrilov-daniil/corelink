@@ -63,6 +63,10 @@ export interface CoreConfig {
   /** Действующая панель Remnawave — читаем при миграции. Только чтение. */
   remnawaveUrl: string;
   remnawaveToken: string;
+  /** Детектор по трафику: нода оценивается от стольких активных клиентов, обычных для этого часа. */
+  trafficDetectMinUsers: number;
+  /** Детектор по трафику: падение активных клиентов против обычного, %, после которого «пропали». 0 — выключен. */
+  trafficDetectDropPct: number;
 }
 
 export function loadConfig(): CoreConfig {
@@ -121,6 +125,8 @@ export function loadConfig(): CoreConfig {
     redisUrl: process.env.REDIS_URL ?? "",
     remnawaveUrl: (process.env.REMNAWAVE_URL ?? "").replace(/\/+$/, ""),
     remnawaveToken: process.env.REMNAWAVE_TOKEN ?? "",
+    trafficDetectMinUsers: intEnv(process.env.TRAFFIC_DETECT_MIN_USERS, 10),
+    trafficDetectDropPct: Math.min(intEnv(process.env.TRAFFIC_DETECT_DROP_PCT, 70), 99),
   };
 }
 

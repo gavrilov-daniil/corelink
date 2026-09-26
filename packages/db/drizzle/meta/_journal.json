@@ -162,6 +162,13 @@
       "when": 1785040170000,
       "tag": "0022_monitoring",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1785040180000,
+      "tag": "0023_traffic_sample_window_idx",
+      "breakpoints": true
     }
   ]
 }

@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, bigint, integer, timestamp, jsonb, uniqueIndex, primaryKey } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, bigint, integer, timestamp, jsonb, index, uniqueIndex, primaryKey } from "drizzle-orm/pg-core";
 import { orgId } from "./_shared.js";
 import { node } from "./infra.js";
 import { subscription } from "./subscribers.js";
@@ -25,7 +25,11 @@ export const trafficSample = pgTable("traffic_sample", {
   downDelta: bigint("down_delta", { mode: "number" }).notNull().default(0),
   windowStart: timestamp("window_start", { withTimezone: true }).notNull(),
   windowEnd: timestamp("window_end", { withTimezone: true }).notNull(),
-}, (t) => [uniqueIndex("traffic_sample_uq").on(t.nodeId, t.subjectType, t.subjectKey, t.windowStart)]);
+}, (t) => [
+  uniqueIndex("traffic_sample_uq").on(t.nodeId, t.subjectType, t.subjectKey, t.windowStart),
+  // окна по времени (детектор по трафику, abuse-scan): уникальным индексом диапазон не взять
+  index("traffic_sample_org_window_idx").on(t.orgId, t.windowStart),
+]);
 
 // АГРЕГАТ (пересчитывается из samples, руками не правится).
 export const trafficDaily = pgTable("traffic_daily", {

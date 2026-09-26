@@ -5,6 +5,7 @@ import {
   getMonitoring,
   type MonitoringChannel,
   type MonitoringNode,
+  type MonitoringNodeTraffic,
   type MonitoringOverview,
   type MonitoringProbe,
 } from "../api";
@@ -27,9 +28,45 @@ const PROBE_WAIT_MS = 180_000;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Лента: переходы пробы и детектора по трафику. */
+const EVENT_KINDS: Record<string, { ok: boolean; label: string }> = {
+  probe_down: { ok: false, label: "упал" },
+  probe_up: { ok: true, label: "восстановился" },
+  traffic_drop: { ok: false, label: "клиенты пропали" },
+  traffic_restore: { ok: true, label: "клиенты вернулись" },
+  network_traffic_drop: { ok: false, label: "сеть просела" },
+  network_traffic_restore: { ok: true, label: "сеть восстановилась" },
+};
+
 function uptime(c: MonitoringChannel): string {
   if (c.checks24h === 0) return "—";
   return `${Math.round((c.passed24h / c.checks24h) * 100)}% (${c.passed24h}/${c.checks24h})`;
+}
+
+/** Клиенты ноды по детектору: цифры всегда, вердикт — когда базы хватает для выводов. */
+function TrafficCell({ t, minUsers }: { t: MonitoringNodeTraffic | undefined; minUsers: number }) {
+  if (!t) return <span className="muted small">—</span>;
+  const now = t.now?.[1] ?? 0;
+  const usual = t.usual ? Math.round(t.usual[1]) : null;
+  const note = {
+    disabled: "детектор выключен",
+    offline: "нода не на связи — о ней скажут проба и heartbeat",
+    no_stats: "агент не присылает статистику",
+    no_history: `копим историю: нужно 3 дня (сейчас активных ${now})`,
+    few_clients: `активных ${now}, обычно ${usual} — меньше ${minUsers}, выводов не делаем`,
+  };
+  if (t.skipped) return <span className="muted small">{note[t.skipped]}</span>;
+  return (
+    <div>
+      <StatusBadge
+        status={t.verdict === "drop" ? "error" : t.verdict === "ok" ? "ok" : "pending"}
+        label={t.verdict === "drop" ? "клиенты пропали" : t.verdict === "ok" ? "в норме" : "меняется"}
+      />
+      <div className="muted small">
+        активных за 5 мин: {now}, обычно {usual}
+      </div>
+    </div>
+  );
 }
 
 /** Итог ручного прогона — по каналам, проверенным после прежнего прогона точки. */
@@ -96,7 +133,7 @@ export default function MonitoringPage() {
   if (page.error) return <ErrorBox error={page.error} onRetry={page.reload} />;
   if (!page.data) return null;
 
-  const { probes, channels, nodes, events } = page.data;
+  const { probes, channels, nodes, events, traffic } = page.data;
   const nodeName = (id: string | null) => nodes.find((n) => n.id === id)?.name ?? "удалённая нода";
   const probeName = (id: string | null) => probes.find((p) => p.id === id)?.name ?? "проба";
 
@@ -151,6 +188,11 @@ export default function MonitoringPage() {
         );
       },
     },
+    {
+      key: "clients",
+      title: "Клиенты (трафик)",
+      render: (n) => <TrafficCell t={traffic.nodes.find((t) => t.nodeId === n.id)} minUsers={traffic.minUsers} />,
+    },
   ];
 
   return (
@@ -185,7 +227,10 @@ export default function MonitoringPage() {
         )}
       </Card>
 
-      <Card title="Ноды" subtitle="Агент и Xray — со слов ноды; проба — настоящий трафик через канал, как у клиента.">
+      <Card
+        title="Ноды"
+        subtitle={`Агент и Xray — со слов ноды; проба — трафик через канал, как у клиента; клиенты — активные за 5 минут против обычного для этого часа (медиана за неделю), выводы — от ${traffic.minUsers} клиентов.`}
+      >
         {nodes.length === 0 ? (
           <EmptyState text="Нод нет" />
         ) : (
@@ -193,25 +238,28 @@ export default function MonitoringPage() {
         )}
       </Card>
 
-      <Card title="События" subtitle="Переходы «работал → упал» и обратно. Повторный провал ленту не засоряет.">
+      <Card title="События" subtitle="Переходы «работал → упал» и обратно — по пробе и по трафику клиентов. Повторный провал ленту не засоряет.">
         {events.length === 0 ? (
           <EmptyState text="Событий нет" hint="Здесь появятся падения и восстановления каналов." />
         ) : (
           <div>
-            {events.map((e) => (
-              <div key={e.id} className="list-row">
-                <div>
-                  <StatusBadge
-                    status={e.kind === "probe_up" ? "ok" : "error"}
-                    label={e.kind === "probe_up" ? "восстановился" : "упал"}
-                  />{" "}
-                  <span className="strong">{nodeName(e.nodeId)}</span>
-                  <span className="muted small"> · {e.channelTag ?? "—"} · {probeName(e.probeId)}</span>
-                  {e.message && <div className="small">{e.message}</div>}
+            {events.map((e) => {
+              const kind = EVENT_KINDS[e.kind] ?? { ok: false, label: e.kind };
+              const network = e.kind.startsWith("network_");
+              return (
+                <div key={e.id} className="list-row">
+                  <div>
+                    <StatusBadge status={kind.ok ? "ok" : "error"} label={kind.label} />{" "}
+                    <span className="strong">{network ? "вся сеть" : nodeName(e.nodeId)}</span>
+                    <span className="muted small">
+                      {e.channelTag ? ` · ${e.channelTag}` : ""} · {e.probeId ? probeName(e.probeId) : "трафик клиентов"}
+                    </span>
+                    {e.message && <div className="small">{e.message}</div>}
+                  </div>
+                  <span className="muted small">{formatDateTime(e.createdAt)}</span>
                 </div>
-                <span className="muted small">{formatDateTime(e.createdAt)}</span>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </Card>

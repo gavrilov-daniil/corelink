@@ -1294,11 +1294,30 @@ export interface MonitoringEvent {
   createdAt: string;
 }
 
+/** Детектор по трафику клиентов: активные за 5-минутный слот против обычного для этого часа. */
+export interface MonitoringNodeTraffic {
+  nodeId: string;
+  /** Почему нода не оценивается; null — оценивается. */
+  skipped: "disabled" | "offline" | "no_stats" | "no_history" | "few_clients" | null;
+  /** Активных клиентов в двух последних слотах. */
+  now: [number, number] | null;
+  /** Обычно в эти слоты — медиана за неделю. */
+  usual: [number, number] | null;
+  verdict: "drop" | "ok" | null;
+}
+
+export interface MonitoringTraffic {
+  minUsers: number;
+  dropPct: number;
+  nodes: MonitoringNodeTraffic[];
+}
+
 export interface MonitoringOverview {
   probes: MonitoringProbe[];
   channels: MonitoringChannel[];
   nodes: MonitoringNode[];
   events: MonitoringEvent[];
+  traffic: MonitoringTraffic;
 }
 
 export const getMonitoring = () => request<MonitoringOverview>("/api/admin/monitoring");
