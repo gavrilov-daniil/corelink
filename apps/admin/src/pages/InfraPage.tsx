@@ -79,19 +79,22 @@ function saveMode(mode: Mode): void {
 
 type Editing<T> = { kind: "create" } | { kind: "edit"; row: T } | null;
 
+/** Всё, что показывает страница: и первая загрузка, и тихое обновление. */
+async function loadInfra() {
+  const [servers, profiles, nodes, inbounds, hosts, squads, delivery] = await Promise.all([
+    getServers(),
+    getConfigProfiles(),
+    getNodes(),
+    getInbounds(),
+    getHosts(),
+    getSquads(),
+    getLocationDelivery(),
+  ]);
+  return { servers, profiles, nodes, inbounds, hosts, squads, delivery };
+}
+
 export default function InfraPage() {
-  const page = useResource(async () => {
-    const [servers, profiles, nodes, inbounds, hosts, squads, delivery] = await Promise.all([
-      getServers(),
-      getConfigProfiles(),
-      getNodes(),
-      getInbounds(),
-      getHosts(),
-      getSquads(),
-      getLocationDelivery(),
-    ]);
-    return { servers, profiles, nodes, inbounds, hosts, squads, delivery };
-  });
+  const page = useResource(loadInfra);
 
   const [serverForm, setServerForm] = useState<Editing<Server>>(null);
   const [profileForm, setProfileForm] = useState<Editing<ConfigProfile>>(null);
@@ -112,6 +115,14 @@ export default function InfraPage() {
     close();
     setNotice(describeRebuild(rebuilt));
     page.reload();
+  };
+
+  // Тихое обновление, не page.reload(): тот на время загрузки заменяет страницу на
+  // «Загрузка», и открытый мастер размонтировался бы вместе с итогом и логом настройки,
+  // а потом открылся бы заново пустой формой. Сбой оставляет данные устаревшими до
+  // «Обновить» — сама локация уже заведена.
+  const refresh = () => {
+    loadInfra().then(page.setData, () => undefined);
   };
 
   const runSshCheck = async (server: Server) => {
@@ -453,7 +464,7 @@ export default function InfraPage() {
           onClose={() => setWizardOpen(false)}
           onProvisioned={(msg) => {
             setNotice(msg);
-            page.reload();
+            refresh();
           }}
         />
       )}
